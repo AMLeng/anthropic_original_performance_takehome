@@ -173,7 +173,7 @@ class KernelBuilder:
 
         # Double buffering: allow overlap of hash and next-group loads
         # Set A processes while set B loads (and vice versa)
-        GROUP_SIZE = 8  # Chunks per pipeline stage
+        GROUP_SIZE = 4  # Chunks per pipeline stage (tuned for even group count)
         sets = [[], []]  # Two sets of chunk data
         for s in range(2):
             for c in range(GROUP_SIZE):
@@ -292,38 +292,37 @@ class KernelBuilder:
         # Main loop with pipelining
         n_groups = (n_chunks + GROUP_SIZE - 1) // GROUP_SIZE
 
+        # Prologue: Load first group into set 0 for round 0
+        g_start = 0
+        g_count = min(GROUP_SIZE, n_chunks - g_start)
+        cur_set = sets[0]
+        cur_data = []
+        for c in range(g_count):
+            cur_data.append({
+                "vec_idx": idx_addrs[g_start + c],
+                "vec_val": val_addrs[g_start + c],
+                "vec_node": cur_set[c]["vec_node"],
+                "vec_t1": cur_set[c]["vec_t1"],
+                "vec_t2": cur_set[c]["vec_t2"],
+                "tree_addrs": cur_set[c]["tree_addrs"],
+            })
+
+        # Compute tree addresses (ALU per-lane to free VALU for hash)
+        alu_ops = []
+        for c in range(g_count):
+            for i in range(VLEN):
+                alu_ops.append(("+", cur_data[c]["tree_addrs"] + i, self.scratch["forest_values_p"], cur_data[c]["vec_idx"] + i))
+        instrs.extend(build_engine_instrs("alu", alu_ops))
+
+        # Load tree values for group 0
+        load_ops = []
+        for c in range(g_count):
+            for i in range(VLEN):
+                load_ops.append(("load", cur_data[c]["vec_node"] + i, cur_data[c]["tree_addrs"] + i))
+        for i in range(0, len(load_ops), SLOT_LIMITS["load"]):
+            instrs.append({"load": load_ops[i:i + SLOT_LIMITS["load"]]})
+
         for round_idx in range(rounds):
-            # Prologue: Load first group into set 0
-            g = 0
-            g_start = g * GROUP_SIZE
-            g_count = min(GROUP_SIZE, n_chunks - g_start)
-            cur_set = sets[0]
-            cur_data = []
-            for c in range(g_count):
-                cur_data.append({
-                    "vec_idx": idx_addrs[g_start + c],
-                    "vec_val": val_addrs[g_start + c],
-                    "vec_node": cur_set[c]["vec_node"],
-                    "vec_t1": cur_set[c]["vec_t1"],
-                    "vec_t2": cur_set[c]["vec_t2"],
-                    "tree_addrs": cur_set[c]["tree_addrs"],
-                })
-
-            # Compute tree addresses (ALU per-lane to free VALU for hash)
-            alu_ops = []
-            for c in range(g_count):
-                for i in range(VLEN):
-                    alu_ops.append(("+", cur_data[c]["tree_addrs"] + i, self.scratch["forest_values_p"], cur_data[c]["vec_idx"] + i))
-            instrs.extend(build_engine_instrs("alu", alu_ops))
-
-            # Load tree values for group 0
-            load_ops = []
-            for c in range(g_count):
-                for i in range(VLEN):
-                    load_ops.append(("load", cur_data[c]["vec_node"] + i, cur_data[c]["tree_addrs"] + i))
-            for i in range(0, len(load_ops), SLOT_LIMITS["load"]):
-                instrs.append({"load": load_ops[i:i + SLOT_LIMITS["load"]]})
-
             # Main pipeline loop
             for g in range(n_groups):
                 g_start = g * GROUP_SIZE
@@ -346,10 +345,17 @@ class KernelBuilder:
 
                 # Build next-group prep (loads + address calc + tree loads)
                 next_prep_instrs = []
+                next_start = None
+                next_count = 0
                 if g + 1 < n_groups:
-                    next_g = g + 1
-                    next_start = next_g * GROUP_SIZE
+                    next_start = (g + 1) * GROUP_SIZE
                     next_count = min(GROUP_SIZE, n_chunks - next_start)
+                elif round_idx + 1 < rounds:
+                    # Preload group 0 for the next round to avoid a per-round prologue
+                    next_start = 0
+                    next_count = min(GROUP_SIZE, n_chunks)
+
+                if next_start is not None:
                     next_data = []
                     for c in range(next_count):
                         next_data.append({
