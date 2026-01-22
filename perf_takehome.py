@@ -164,11 +164,11 @@ class KernelBuilder:
             instrs.append({"flow": [("add_imm", chunk_addr_idx[c], self.scratch["inp_indices_p"], offset)]})
             instrs.append({"flow": [("add_imm", chunk_addr_val[c], self.scratch["inp_values_p"], offset)]})
 
-        # Double buffering: two sets of scratch for pipelining
-        # Set A processes while set B loads (and vice versa)
+        # Triple buffering: allow overlap of hash, next-group loads, and prior stores
+        # Set A processes while set B loads and set C stores (and vice versa)
         GROUP_SIZE = 8  # Chunks per pipeline stage
-        sets = [[], []]  # Two sets of chunk data
-        for s in range(2):
+        sets = [[], [], []]  # Three sets of chunk data
+        for s in range(3):
             for c in range(GROUP_SIZE):
                 sets[s].append({
                     "vec_idx": self.alloc_scratch(f"vi_{s}_{c}", VLEN),
@@ -267,6 +267,7 @@ class KernelBuilder:
         n_groups = (n_chunks + GROUP_SIZE - 1) // GROUP_SIZE
 
         for round_idx in range(rounds):
+            pending_store_instrs = []
             # Prologue: Load first group into set 0
             g = 0
             g_start = g * GROUP_SIZE
@@ -305,24 +306,11 @@ class KernelBuilder:
             for g in range(n_groups):
                 g_start = g * GROUP_SIZE
                 g_count = min(GROUP_SIZE, n_chunks - g_start)
-                cur_set = sets[g % 2]
-                next_set = sets[(g + 1) % 2]
+                cur_set = sets[g % 3]
+                next_set = sets[(g + 1) % 3]
 
                 # Build hash and index update for current group
                 hash_instrs = build_hash_and_index_instrs(cur_set, g_count)
-
-                # Build stores for current group
-                store_instrs = []
-                for c in range(0, g_count, 2):
-                    ops = [("vstore", chunk_addr_idx[g_start + c], cur_set[c]["vec_idx"])]
-                    if c + 1 < g_count:
-                        ops.append(("vstore", chunk_addr_idx[g_start + c + 1], cur_set[c + 1]["vec_idx"]))
-                    store_instrs.append({"store": ops})
-                for c in range(0, g_count, 2):
-                    ops = [("vstore", chunk_addr_val[g_start + c], cur_set[c]["vec_val"])]
-                    if c + 1 < g_count:
-                        ops.append(("vstore", chunk_addr_val[g_start + c + 1], cur_set[c + 1]["vec_val"]))
-                    store_instrs.append({"store": ops})
 
                 # Build next-group prep (loads + address calc + tree loads)
                 next_prep_instrs = []
@@ -356,11 +344,28 @@ class KernelBuilder:
                             load_ops.append(("load", next_set[c]["vec_node"] + i, next_set[c]["tree_addrs"] + i))
                     next_prep_instrs += build_engine_instrs("load", load_ops)
 
-                # Overlap hash with next-group prep where safe (different engines)
+                # Overlap hash with next-group prep, and overlap prior stores with both
                 merged = merge_streams(hash_instrs, next_prep_instrs)
+                if pending_store_instrs:
+                    merged = merge_streams(merged, pending_store_instrs)
                 instrs.extend(merged)
-                # Stores depend on hash completion; keep them after the hash stream
-                instrs.extend(store_instrs)
+
+                # Build stores for current group (deferred to overlap with next iteration)
+                store_instrs = []
+                for c in range(0, g_count, 2):
+                    ops = [("vstore", chunk_addr_idx[g_start + c], cur_set[c]["vec_idx"])]
+                    if c + 1 < g_count:
+                        ops.append(("vstore", chunk_addr_idx[g_start + c + 1], cur_set[c + 1]["vec_idx"]))
+                    store_instrs.append({"store": ops})
+                for c in range(0, g_count, 2):
+                    ops = [("vstore", chunk_addr_val[g_start + c], cur_set[c]["vec_val"])]
+                    if c + 1 < g_count:
+                        ops.append(("vstore", chunk_addr_val[g_start + c + 1], cur_set[c + 1]["vec_val"]))
+                    store_instrs.append({"store": ops})
+                pending_store_instrs = store_instrs
+            # Flush final stores for the last group
+            if pending_store_instrs:
+                instrs.extend(pending_store_instrs)
 
         instrs.append({"flow": [("pause",)]})
 
