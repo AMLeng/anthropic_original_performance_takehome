@@ -147,6 +147,9 @@ class KernelBuilder:
         vec_n_nodes = self.alloc_scratch("vec_n_nodes", VLEN)
         instrs.append({"valu": [("vbroadcast", vec_n_nodes, self.scratch["n_nodes"])]})
 
+        vec_forest_values_p = self.alloc_scratch("vec_forest_values_p", VLEN)
+        instrs.append({"valu": [("vbroadcast", vec_forest_values_p, self.scratch["forest_values_p"])]})
+
         vec_zero, vec_one, vec_two = vec_const_addrs[0], vec_const_addrs[1], vec_const_addrs[2]
         vec_hash_consts = [(vec_const_addrs[s[1]], vec_const_addrs[s[4]]) for s in HASH_STAGES]
 
@@ -173,7 +176,7 @@ class KernelBuilder:
                     "vec_node": self.alloc_scratch(f"vn_{s}_{c}", VLEN),
                     "vec_t1": self.alloc_scratch(f"vt1_{s}_{c}", VLEN),
                     "vec_t2": self.alloc_scratch(f"vt2_{s}_{c}", VLEN),
-                    "tree_addrs": [self.alloc_scratch(f"ta_{s}_{c}_{i}") for i in range(VLEN)],
+                    "tree_addrs": self.alloc_scratch(f"ta_{s}_{c}", VLEN),
                 })
 
         instrs.append({"flow": [("pause",)]})
@@ -228,18 +231,13 @@ class KernelBuilder:
                 instrs.append({"load": ops})
 
             # Compute tree addresses
-            alu_ops = []
-            for c in range(g_count):
-                for i in range(VLEN):
-                    alu_ops.append(("+", cur_set[c]["tree_addrs"][i], self.scratch["forest_values_p"], cur_set[c]["vec_idx"] + i))
-            for i in range(0, len(alu_ops), SLOT_LIMITS["alu"]):
-                instrs.append({"alu": alu_ops[i:i + SLOT_LIMITS["alu"]]})
+            emit_valu([("+", cur_set[c]["tree_addrs"], vec_forest_values_p, cur_set[c]["vec_idx"]) for c in range(g_count)])
 
             # Load tree values for group 0
             load_ops = []
             for c in range(g_count):
                 for i in range(VLEN):
-                    load_ops.append(("load", cur_set[c]["vec_node"] + i, cur_set[c]["tree_addrs"][i]))
+                    load_ops.append(("load", cur_set[c]["vec_node"] + i, cur_set[c]["tree_addrs"] + i))
             for i in range(0, len(load_ops), SLOT_LIMITS["load"]):
                 instrs.append({"load": load_ops[i:i + SLOT_LIMITS["load"]]})
 
@@ -284,18 +282,13 @@ class KernelBuilder:
                         instrs.append({"load": ops})
 
                     # Compute tree addresses
-                    alu_ops = []
-                    for c in range(next_count):
-                        for i in range(VLEN):
-                            alu_ops.append(("+", next_set[c]["tree_addrs"][i], self.scratch["forest_values_p"], next_set[c]["vec_idx"] + i))
-                    for i in range(0, len(alu_ops), SLOT_LIMITS["alu"]):
-                        instrs.append({"alu": alu_ops[i:i + SLOT_LIMITS["alu"]]})
+                    emit_valu([("+", next_set[c]["tree_addrs"], vec_forest_values_p, next_set[c]["vec_idx"]) for c in range(next_count)])
 
                     # Load tree values
                     load_ops = []
                     for c in range(next_count):
                         for i in range(VLEN):
-                            load_ops.append(("load", next_set[c]["vec_node"] + i, next_set[c]["tree_addrs"][i]))
+                            load_ops.append(("load", next_set[c]["vec_node"] + i, next_set[c]["tree_addrs"] + i))
                     for i in range(0, len(load_ops), SLOT_LIMITS["load"]):
                         instrs.append({"load": load_ops[i:i + SLOT_LIMITS["load"]]})
 
