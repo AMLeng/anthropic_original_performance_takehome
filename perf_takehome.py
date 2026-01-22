@@ -281,16 +281,13 @@ class KernelBuilder:
             )
             instrs_out += build_engine_instrs(
                 "valu",
-                [("-", data[c]["vec_t1"], vec_zero, data[c]["vec_t1"]) for c in range(count)],
-            )
-            instrs_out += build_engine_instrs(
-                "valu",
-                [("&", data[c]["vec_idx"], data[c]["vec_idx"], data[c]["vec_t1"]) for c in range(count)],
+                [("*", data[c]["vec_idx"], data[c]["vec_idx"], data[c]["vec_t1"]) for c in range(count)],
             )
             return instrs_out
 
         # Main loop with pipelining
         n_groups = (n_chunks + GROUP_SIZE - 1) // GROUP_SIZE
+        start_set = 0
 
         # Prologue: Load first group into set 0 for round 0
         g_start = 0
@@ -327,8 +324,8 @@ class KernelBuilder:
             for g in range(n_groups):
                 g_start = g * GROUP_SIZE
                 g_count = min(GROUP_SIZE, n_chunks - g_start)
-                cur_set = sets[g % 2]
-                next_set = sets[(g + 1) % 2]
+                cur_set = sets[(start_set + g) % 2]
+                next_set = sets[(start_set + g + 1) % 2]
                 cur_data = []
                 for c in range(g_count):
                     cur_data.append({
@@ -342,6 +339,20 @@ class KernelBuilder:
 
                 # Build hash and index update for current group
                 hash_instrs = build_hash_and_index_instrs(cur_data, g_count)
+                if round_idx == rounds - 1:
+                    # Last round: store results as soon as this group completes
+                    store_instrs = []
+                    for c in range(0, g_count, 2):
+                        ops = [("vstore", chunk_addr_idx[g_start + c], cur_data[c]["vec_idx"])]
+                        if c + 1 < g_count:
+                            ops.append(("vstore", chunk_addr_idx[g_start + c + 1], cur_data[c + 1]["vec_idx"]))
+                        store_instrs.append({"store": ops})
+                    for c in range(0, g_count, 2):
+                        ops = [("vstore", chunk_addr_val[g_start + c], cur_data[c]["vec_val"])]
+                        if c + 1 < g_count:
+                            ops.append(("vstore", chunk_addr_val[g_start + c + 1], cur_data[c + 1]["vec_val"]))
+                        store_instrs.append({"store": ops})
+                    hash_instrs.extend(store_instrs)
 
                 # Build next-group prep (loads + address calc + tree loads)
                 next_prep_instrs = []
@@ -381,18 +392,8 @@ class KernelBuilder:
 
                 # Overlap hash with next-group prep where safe (different engines)
                 instrs.extend(merge_streams(hash_instrs, next_prep_instrs))
-
-        # Store all indices and values back to memory once after all rounds
-        for c in range(0, n_chunks, 2):
-            ops = [("vstore", chunk_addr_idx[c], idx_addrs[c])]
-            if c + 1 < n_chunks:
-                ops.append(("vstore", chunk_addr_idx[c + 1], idx_addrs[c + 1]))
-            instrs.append({"store": ops})
-        for c in range(0, n_chunks, 2):
-            ops = [("vstore", chunk_addr_val[c], val_addrs[c])]
-            if c + 1 < n_chunks:
-                ops.append(("vstore", chunk_addr_val[c + 1], val_addrs[c + 1]))
-            instrs.append({"store": ops})
+            # Align next round's start_set with the last group's prefetch target
+            start_set = (start_set + n_groups) % 2
 
         instrs.append({"flow": [("pause",)]})
 
