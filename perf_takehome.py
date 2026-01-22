@@ -44,6 +44,7 @@ class KernelBuilder:
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
+        self.vec_const_map = {}
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -57,6 +58,10 @@ class KernelBuilder:
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
+
+    def add_instr(self, instr):
+        """Add a pre-built instruction dict directly."""
+        self.instrs.append(instr)
 
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
@@ -74,6 +79,15 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
+    def scratch_vec_const(self, val, name=None):
+        """Allocate a vector constant by broadcasting a scalar."""
+        if val not in self.vec_const_map:
+            scalar_addr = self.scratch_const(val)
+            vec_addr = self.alloc_scratch(name, VLEN)
+            self.add("valu", ("vbroadcast", vec_addr, scalar_addr))
+            self.vec_const_map[val] = vec_addr
+        return self.vec_const_map[val]
+
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
 
@@ -89,89 +103,203 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
+        Highly optimized vectorized kernel.
+        Key optimizations:
+        - VALU for 8-wide SIMD
+        - Eliminate vselect using pure VALU arithmetic
+        - Precompute all chunk addresses at init (they don't change)
+        - Maximize instruction packing
         """
-        tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
-        init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
-        ]
+        instrs = self.instrs
+        n_chunks = batch_size // VLEN
+
+        # Allocate and load memory layout parameters
+        init_vars = ["rounds", "n_nodes", "batch_size", "forest_height",
+                     "forest_values_p", "inp_indices_p", "inp_values_p"]
         for v in init_vars:
             self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
 
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        # Load header values efficiently
+        for i in range(0, len(init_vars), 2):
+            n = min(2, len(init_vars) - i)
+            instrs.append({"load": [("const", self.scratch[init_vars[i + j]], i + j) for j in range(n)]})
+            instrs.append({"load": [("load", self.scratch[init_vars[i + j]], self.scratch[init_vars[i + j]]) for j in range(n)]})
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
-        self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
+        # Pre-allocate constants
+        const_vals = list(set([0, 1, 2] + [s[1] for s in HASH_STAGES] + [s[4] for s in HASH_STAGES]))
+        const_addrs = {}
+        for i in range(0, len(const_vals), 2):
+            ops = []
+            for j in range(min(2, len(const_vals) - i)):
+                addr = self.alloc_scratch(f"c_{const_vals[i+j]}")
+                const_addrs[const_vals[i + j]] = addr
+                ops.append(("const", addr, const_vals[i + j]))
+            instrs.append({"load": ops})
+        self.const_map = const_addrs
 
-        body = []  # array of slots
+        # Broadcast constants to vectors
+        vec_const_addrs = {}
+        for val in const_vals:
+            vec_addr = self.alloc_scratch(f"vc_{val}", VLEN)
+            vec_const_addrs[val] = vec_addr
+            instrs.append({"valu": [("vbroadcast", vec_addr, const_addrs[val])]})
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        vec_n_nodes = self.alloc_scratch("vec_n_nodes", VLEN)
+        instrs.append({"valu": [("vbroadcast", vec_n_nodes, self.scratch["n_nodes"])]})
 
-        for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+        vec_zero, vec_one, vec_two = vec_const_addrs[0], vec_const_addrs[1], vec_const_addrs[2]
+        vec_hash_consts = [(vec_const_addrs[s[1]], vec_const_addrs[s[4]]) for s in HASH_STAGES]
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
-        self.instrs.append({"flow": [("pause",)]})
+        # Precompute ALL chunk addresses at initialization (they never change!)
+        # This eliminates add_imm from the hot loop
+        chunk_addr_idx = [self.alloc_scratch(f"cai_{c}") for c in range(n_chunks)]
+        chunk_addr_val = [self.alloc_scratch(f"cav_{c}") for c in range(n_chunks)]
+
+        # Compute chunk addresses using add_imm (only once at init, not per round!)
+        for c in range(n_chunks):
+            offset = c * VLEN
+            instrs.append({"flow": [("add_imm", chunk_addr_idx[c], self.scratch["inp_indices_p"], offset)]})
+            instrs.append({"flow": [("add_imm", chunk_addr_val[c], self.scratch["inp_values_p"], offset)]})
+
+        # Double buffering: two sets of scratch for pipelining
+        # Set A processes while set B loads (and vice versa)
+        GROUP_SIZE = 8  # Chunks per pipeline stage
+        sets = [[], []]  # Two sets of chunk data
+        for s in range(2):
+            for c in range(GROUP_SIZE):
+                sets[s].append({
+                    "vec_idx": self.alloc_scratch(f"vi_{s}_{c}", VLEN),
+                    "vec_val": self.alloc_scratch(f"vv_{s}_{c}", VLEN),
+                    "vec_node": self.alloc_scratch(f"vn_{s}_{c}", VLEN),
+                    "vec_t1": self.alloc_scratch(f"vt1_{s}_{c}", VLEN),
+                    "vec_t2": self.alloc_scratch(f"vt2_{s}_{c}", VLEN),
+                    "tree_addrs": [self.alloc_scratch(f"ta_{s}_{c}_{i}") for i in range(VLEN)],
+                })
+
+        instrs.append({"flow": [("pause",)]})
+
+        # Helper to emit valu ops
+        def emit_valu(ops):
+            for i in range(0, len(ops), SLOT_LIMITS["valu"]):
+                instrs.append({"valu": ops[i:i + SLOT_LIMITS["valu"]]})
+
+        # Helper to compute hash and index update for a set
+        def emit_hash_and_index(data, count):
+            # XOR
+            emit_valu([("^", data[c]["vec_val"], data[c]["vec_val"], data[c]["vec_node"]) for c in range(count)])
+            # Hash
+            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                vc1, vc2 = vec_hash_consts[hi]
+                ops = []
+                for c in range(count):
+                    ops.append((op1, data[c]["vec_t1"], data[c]["vec_val"], vc1))
+                    ops.append((op3, data[c]["vec_t2"], data[c]["vec_val"], vc2))
+                emit_valu(ops)
+                emit_valu([(op2, data[c]["vec_val"], data[c]["vec_t1"], data[c]["vec_t2"]) for c in range(count)])
+            # Index update
+            emit_valu([("&", data[c]["vec_t1"], data[c]["vec_val"], vec_one) for c in range(count)])
+            emit_valu([("+", data[c]["vec_t1"], data[c]["vec_t1"], vec_one) for c in range(count)])
+            emit_valu([("*", data[c]["vec_idx"], data[c]["vec_idx"], vec_two) for c in range(count)])
+            emit_valu([("+", data[c]["vec_idx"], data[c]["vec_idx"], data[c]["vec_t1"]) for c in range(count)])
+            emit_valu([("<", data[c]["vec_t1"], data[c]["vec_idx"], vec_n_nodes) for c in range(count)])
+            emit_valu([("-", data[c]["vec_t1"], vec_zero, data[c]["vec_t1"]) for c in range(count)])
+            emit_valu([("&", data[c]["vec_idx"], data[c]["vec_idx"], data[c]["vec_t1"]) for c in range(count)])
+
+        # Main loop with pipelining
+        n_groups = (n_chunks + GROUP_SIZE - 1) // GROUP_SIZE
+
+        for round_idx in range(rounds):
+            # Prologue: Load first group into set 0
+            g = 0
+            g_start = g * GROUP_SIZE
+            g_count = min(GROUP_SIZE, n_chunks - g_start)
+            cur_set = sets[0]
+
+            # vload indices and values
+            for c in range(0, g_count, 2):
+                ops = [("vload", cur_set[c]["vec_idx"], chunk_addr_idx[g_start + c])]
+                if c + 1 < g_count:
+                    ops.append(("vload", cur_set[c+1]["vec_idx"], chunk_addr_idx[g_start + c + 1]))
+                instrs.append({"load": ops})
+            for c in range(0, g_count, 2):
+                ops = [("vload", cur_set[c]["vec_val"], chunk_addr_val[g_start + c])]
+                if c + 1 < g_count:
+                    ops.append(("vload", cur_set[c+1]["vec_val"], chunk_addr_val[g_start + c + 1]))
+                instrs.append({"load": ops})
+
+            # Compute tree addresses
+            alu_ops = []
+            for c in range(g_count):
+                for i in range(VLEN):
+                    alu_ops.append(("+", cur_set[c]["tree_addrs"][i], self.scratch["forest_values_p"], cur_set[c]["vec_idx"] + i))
+            for i in range(0, len(alu_ops), SLOT_LIMITS["alu"]):
+                instrs.append({"alu": alu_ops[i:i + SLOT_LIMITS["alu"]]})
+
+            # Load tree values for group 0
+            load_ops = []
+            for c in range(g_count):
+                for i in range(VLEN):
+                    load_ops.append(("load", cur_set[c]["vec_node"] + i, cur_set[c]["tree_addrs"][i]))
+            for i in range(0, len(load_ops), SLOT_LIMITS["load"]):
+                instrs.append({"load": load_ops[i:i + SLOT_LIMITS["load"]]})
+
+            # Main pipeline loop
+            for g in range(n_groups):
+                g_start = g * GROUP_SIZE
+                g_count = min(GROUP_SIZE, n_chunks - g_start)
+                cur_set = sets[g % 2]
+                next_set = sets[(g + 1) % 2]
+
+                # Compute hash and index update for current group
+                emit_hash_and_index(cur_set, g_count)
+
+                # Store results for current group (overlaps with next group's load prep)
+                for c in range(0, g_count, 2):
+                    ops = [("vstore", chunk_addr_idx[g_start + c], cur_set[c]["vec_idx"])]
+                    if c + 1 < g_count:
+                        ops.append(("vstore", chunk_addr_idx[g_start + c + 1], cur_set[c+1]["vec_idx"]))
+                    instrs.append({"store": ops})
+                for c in range(0, g_count, 2):
+                    ops = [("vstore", chunk_addr_val[g_start + c], cur_set[c]["vec_val"])]
+                    if c + 1 < g_count:
+                        ops.append(("vstore", chunk_addr_val[g_start + c + 1], cur_set[c+1]["vec_val"]))
+                    instrs.append({"store": ops})
+
+                # Load next group (if any)
+                if g + 1 < n_groups:
+                    next_g = g + 1
+                    next_start = next_g * GROUP_SIZE
+                    next_count = min(GROUP_SIZE, n_chunks - next_start)
+
+                    # vload indices and values
+                    for c in range(0, next_count, 2):
+                        ops = [("vload", next_set[c]["vec_idx"], chunk_addr_idx[next_start + c])]
+                        if c + 1 < next_count:
+                            ops.append(("vload", next_set[c+1]["vec_idx"], chunk_addr_idx[next_start + c + 1]))
+                        instrs.append({"load": ops})
+                    for c in range(0, next_count, 2):
+                        ops = [("vload", next_set[c]["vec_val"], chunk_addr_val[next_start + c])]
+                        if c + 1 < next_count:
+                            ops.append(("vload", next_set[c+1]["vec_val"], chunk_addr_val[next_start + c + 1]))
+                        instrs.append({"load": ops})
+
+                    # Compute tree addresses
+                    alu_ops = []
+                    for c in range(next_count):
+                        for i in range(VLEN):
+                            alu_ops.append(("+", next_set[c]["tree_addrs"][i], self.scratch["forest_values_p"], next_set[c]["vec_idx"] + i))
+                    for i in range(0, len(alu_ops), SLOT_LIMITS["alu"]):
+                        instrs.append({"alu": alu_ops[i:i + SLOT_LIMITS["alu"]]})
+
+                    # Load tree values
+                    load_ops = []
+                    for c in range(next_count):
+                        for i in range(VLEN):
+                            load_ops.append(("load", next_set[c]["vec_node"] + i, next_set[c]["tree_addrs"][i]))
+                    for i in range(0, len(load_ops), SLOT_LIMITS["load"]):
+                        instrs.append({"load": load_ops[i:i + SLOT_LIMITS["load"]]})
+
+        instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
 
