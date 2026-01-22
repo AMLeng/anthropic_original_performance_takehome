@@ -181,15 +181,45 @@ class KernelBuilder:
 
         instrs.append({"flow": [("pause",)]})
 
-        # Helper to emit valu ops
-        def emit_valu(ops):
-            for i in range(0, len(ops), SLOT_LIMITS["valu"]):
-                instrs.append({"valu": ops[i:i + SLOT_LIMITS["valu"]]})
+        # Helper to build instruction bundles for a single engine
+        def build_engine_instrs(engine, ops):
+            if not ops:
+                return []
+            limit = SLOT_LIMITS[engine]
+            return [{engine: ops[i:i + limit]} for i in range(0, len(ops), limit)]
+
+        # Helper to merge two streams of single-engine bundles without reordering
+        def merge_streams(primary, secondary):
+            merged = []
+            i = j = 0
+            while i < len(primary) or j < len(secondary):
+                if i >= len(primary):
+                    merged.append(secondary[j])
+                    j += 1
+                    continue
+                if j >= len(secondary):
+                    merged.append(primary[i])
+                    i += 1
+                    continue
+                p = primary[i]
+                s = secondary[j]
+                if set(p.keys()).isdisjoint(s.keys()):
+                    merged.append({**p, **s})
+                    i += 1
+                    j += 1
+                else:
+                    merged.append(p)
+                    i += 1
+            return merged
 
         # Helper to compute hash and index update for a set
-        def emit_hash_and_index(data, count):
+        def build_hash_and_index_instrs(data, count):
+            instrs_out = []
             # XOR
-            emit_valu([("^", data[c]["vec_val"], data[c]["vec_val"], data[c]["vec_node"]) for c in range(count)])
+            instrs_out += build_engine_instrs(
+                "valu",
+                [("^", data[c]["vec_val"], data[c]["vec_val"], data[c]["vec_node"]) for c in range(count)],
+            )
             # Hash
             for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                 vc1, vc2 = vec_hash_consts[hi]
@@ -197,16 +227,41 @@ class KernelBuilder:
                 for c in range(count):
                     ops.append((op1, data[c]["vec_t1"], data[c]["vec_val"], vc1))
                     ops.append((op3, data[c]["vec_t2"], data[c]["vec_val"], vc2))
-                emit_valu(ops)
-                emit_valu([(op2, data[c]["vec_val"], data[c]["vec_t1"], data[c]["vec_t2"]) for c in range(count)])
+                instrs_out += build_engine_instrs("valu", ops)
+                instrs_out += build_engine_instrs(
+                    "valu",
+                    [(op2, data[c]["vec_val"], data[c]["vec_t1"], data[c]["vec_t2"]) for c in range(count)],
+                )
             # Index update
-            emit_valu([("&", data[c]["vec_t1"], data[c]["vec_val"], vec_one) for c in range(count)])
-            emit_valu([("+", data[c]["vec_t1"], data[c]["vec_t1"], vec_one) for c in range(count)])
-            emit_valu([("*", data[c]["vec_idx"], data[c]["vec_idx"], vec_two) for c in range(count)])
-            emit_valu([("+", data[c]["vec_idx"], data[c]["vec_idx"], data[c]["vec_t1"]) for c in range(count)])
-            emit_valu([("<", data[c]["vec_t1"], data[c]["vec_idx"], vec_n_nodes) for c in range(count)])
-            emit_valu([("-", data[c]["vec_t1"], vec_zero, data[c]["vec_t1"]) for c in range(count)])
-            emit_valu([("&", data[c]["vec_idx"], data[c]["vec_idx"], data[c]["vec_t1"]) for c in range(count)])
+            instrs_out += build_engine_instrs(
+                "valu",
+                [("&", data[c]["vec_t1"], data[c]["vec_val"], vec_one) for c in range(count)],
+            )
+            instrs_out += build_engine_instrs(
+                "valu",
+                [("+", data[c]["vec_t1"], data[c]["vec_t1"], vec_one) for c in range(count)],
+            )
+            instrs_out += build_engine_instrs(
+                "valu",
+                [("*", data[c]["vec_idx"], data[c]["vec_idx"], vec_two) for c in range(count)],
+            )
+            instrs_out += build_engine_instrs(
+                "valu",
+                [("+", data[c]["vec_idx"], data[c]["vec_idx"], data[c]["vec_t1"]) for c in range(count)],
+            )
+            instrs_out += build_engine_instrs(
+                "valu",
+                [("<", data[c]["vec_t1"], data[c]["vec_idx"], vec_n_nodes) for c in range(count)],
+            )
+            instrs_out += build_engine_instrs(
+                "valu",
+                [("-", data[c]["vec_t1"], vec_zero, data[c]["vec_t1"]) for c in range(count)],
+            )
+            instrs_out += build_engine_instrs(
+                "valu",
+                [("&", data[c]["vec_idx"], data[c]["vec_idx"], data[c]["vec_t1"]) for c in range(count)],
+            )
+            return instrs_out
 
         # Main loop with pipelining
         n_groups = (n_chunks + GROUP_SIZE - 1) // GROUP_SIZE
@@ -231,7 +286,12 @@ class KernelBuilder:
                 instrs.append({"load": ops})
 
             # Compute tree addresses
-            emit_valu([("+", cur_set[c]["tree_addrs"], vec_forest_values_p, cur_set[c]["vec_idx"]) for c in range(g_count)])
+            instrs.extend(
+                build_engine_instrs(
+                    "valu",
+                    [("+", cur_set[c]["tree_addrs"], vec_forest_values_p, cur_set[c]["vec_idx"]) for c in range(g_count)],
+                )
+            )
 
             # Load tree values for group 0
             load_ops = []
@@ -248,49 +308,59 @@ class KernelBuilder:
                 cur_set = sets[g % 2]
                 next_set = sets[(g + 1) % 2]
 
-                # Compute hash and index update for current group
-                emit_hash_and_index(cur_set, g_count)
+                # Build hash and index update for current group
+                hash_instrs = build_hash_and_index_instrs(cur_set, g_count)
 
-                # Store results for current group (overlaps with next group's load prep)
+                # Build stores for current group
+                store_instrs = []
                 for c in range(0, g_count, 2):
                     ops = [("vstore", chunk_addr_idx[g_start + c], cur_set[c]["vec_idx"])]
                     if c + 1 < g_count:
-                        ops.append(("vstore", chunk_addr_idx[g_start + c + 1], cur_set[c+1]["vec_idx"]))
-                    instrs.append({"store": ops})
+                        ops.append(("vstore", chunk_addr_idx[g_start + c + 1], cur_set[c + 1]["vec_idx"]))
+                    store_instrs.append({"store": ops})
                 for c in range(0, g_count, 2):
                     ops = [("vstore", chunk_addr_val[g_start + c], cur_set[c]["vec_val"])]
                     if c + 1 < g_count:
-                        ops.append(("vstore", chunk_addr_val[g_start + c + 1], cur_set[c+1]["vec_val"]))
-                    instrs.append({"store": ops})
+                        ops.append(("vstore", chunk_addr_val[g_start + c + 1], cur_set[c + 1]["vec_val"]))
+                    store_instrs.append({"store": ops})
 
-                # Load next group (if any)
+                # Build next-group prep (loads + address calc + tree loads)
+                next_prep_instrs = []
                 if g + 1 < n_groups:
                     next_g = g + 1
                     next_start = next_g * GROUP_SIZE
                     next_count = min(GROUP_SIZE, n_chunks - next_start)
 
-                    # vload indices and values
+                    load_ops = []
                     for c in range(0, next_count, 2):
-                        ops = [("vload", next_set[c]["vec_idx"], chunk_addr_idx[next_start + c])]
+                        load_ops.append(("vload", next_set[c]["vec_idx"], chunk_addr_idx[next_start + c]))
                         if c + 1 < next_count:
-                            ops.append(("vload", next_set[c+1]["vec_idx"], chunk_addr_idx[next_start + c + 1]))
-                        instrs.append({"load": ops})
+                            load_ops.append(("vload", next_set[c + 1]["vec_idx"], chunk_addr_idx[next_start + c + 1]))
+                    next_prep_instrs += build_engine_instrs("load", load_ops)
+
+                    load_ops = []
                     for c in range(0, next_count, 2):
-                        ops = [("vload", next_set[c]["vec_val"], chunk_addr_val[next_start + c])]
+                        load_ops.append(("vload", next_set[c]["vec_val"], chunk_addr_val[next_start + c]))
                         if c + 1 < next_count:
-                            ops.append(("vload", next_set[c+1]["vec_val"], chunk_addr_val[next_start + c + 1]))
-                        instrs.append({"load": ops})
+                            load_ops.append(("vload", next_set[c + 1]["vec_val"], chunk_addr_val[next_start + c + 1]))
+                    next_prep_instrs += build_engine_instrs("load", load_ops)
 
-                    # Compute tree addresses
-                    emit_valu([("+", next_set[c]["tree_addrs"], vec_forest_values_p, next_set[c]["vec_idx"]) for c in range(next_count)])
+                    next_prep_instrs += build_engine_instrs(
+                        "valu",
+                        [("+", next_set[c]["tree_addrs"], vec_forest_values_p, next_set[c]["vec_idx"]) for c in range(next_count)],
+                    )
 
-                    # Load tree values
                     load_ops = []
                     for c in range(next_count):
                         for i in range(VLEN):
                             load_ops.append(("load", next_set[c]["vec_node"] + i, next_set[c]["tree_addrs"] + i))
-                    for i in range(0, len(load_ops), SLOT_LIMITS["load"]):
-                        instrs.append({"load": load_ops[i:i + SLOT_LIMITS["load"]]})
+                    next_prep_instrs += build_engine_instrs("load", load_ops)
+
+                # Overlap hash with next-group prep where safe (different engines)
+                merged = merge_streams(hash_instrs, next_prep_instrs)
+                instrs.extend(merged)
+                # Stores depend on hash completion; keep them after the hash stream
+                instrs.extend(store_instrs)
 
         instrs.append({"flow": [("pause",)]})
 
