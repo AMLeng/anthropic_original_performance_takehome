@@ -42,14 +42,14 @@ class _InstrCollector:
     def __init__(self, owner):
         self._owner = owner
 
-    def append(self, instr):
+    def append(self, instr, note: str = ""):
         for engine, slots in instr.items():
             for slot in slots:
-                self._owner.add_ast(engine, slot)
+                self._owner.add_ast(engine, slot, note=note)
 
-    def extend(self, instrs):
+    def extend(self, instrs, note: str = ""):
         for instr in instrs:
-            self.append(instr)
+            self.append(instr, note=note)
 
 
 class KernelBuilder:
@@ -78,14 +78,14 @@ class KernelBuilder:
             instrs.append({engine: [slot]})
         return instrs
 
-    def add(self, engine, slot):
-        self.add_ast(engine, slot)
+    def add(self, engine, slot, note: str = ""):
+        self.add_ast(engine, slot, note=note)
 
-    def add_instr(self, instr):
+    def add_instr(self, instr, note: str = ""):
         """Add a pre-built instruction dict directly."""
         for engine, slots in instr.items():
             for slot in slots:
-                self.add_ast(engine, slot)
+                self.add_ast(engine, slot, note=note)
 
     def add_ast(self, engine, slot, note: str = ""):
         engine_kind = EngineKind(engine) if not isinstance(engine, EngineKind) else engine
@@ -221,8 +221,14 @@ class KernelBuilder:
         # Load header values efficiently
         for i in range(0, len(init_vars), 2):
             n = min(2, len(init_vars) - i)
-            instrs.append({"load": [("const", self.scratch[init_vars[i + j]], i + j) for j in range(n)]})
-            instrs.append({"load": [("load", self.scratch[init_vars[i + j]], self.scratch[init_vars[i + j]]) for j in range(n)]})
+            instrs.append(
+                {"load": [("const", self.scratch[init_vars[i + j]], i + j) for j in range(n)]},
+                note="init",
+            )
+            instrs.append(
+                {"load": [("load", self.scratch[init_vars[i + j]], self.scratch[init_vars[i + j]]) for j in range(n)]},
+                note="init",
+            )
 
         # Pre-allocate constants
         mul_vals = []
@@ -237,7 +243,7 @@ class KernelBuilder:
                 addr = self.alloc_scratch(f"c_{const_vals[i+j]}")
                 const_addrs[const_vals[i + j]] = addr
                 ops.append(("const", addr, const_vals[i + j]))
-            instrs.append({"load": ops})
+            instrs.append({"load": ops}, note="init")
         self.const_map = const_addrs
 
         # Broadcast constants to vectors (only those needed for vector ops)
@@ -246,10 +252,10 @@ class KernelBuilder:
         for val in vec_const_vals:
             vec_addr = self.alloc_scratch(f"vc_{val}", VLEN)
             vec_const_addrs[val] = vec_addr
-            instrs.append({"valu": [("vbroadcast", vec_addr, const_addrs[val])]})
+            instrs.append({"valu": [("vbroadcast", vec_addr, const_addrs[val])]}, note="init")
 
         vec_n_nodes = self.alloc_scratch("vec_n_nodes", VLEN)
-        instrs.append({"valu": [("vbroadcast", vec_n_nodes, self.scratch["n_nodes"])]})
+        instrs.append({"valu": [("vbroadcast", vec_n_nodes, self.scratch["n_nodes"])]}, note="init")
 
         vec_zero, vec_one, vec_two = vec_const_addrs[0], vec_const_addrs[1], vec_const_addrs[2]
         hash_stage_info = []
@@ -264,15 +270,18 @@ class KernelBuilder:
         cur_level = self.alloc_scratch("cur_level", 1)
         cur_level_next = self.alloc_scratch("cur_level_next", 1)
         cur_level_cond = self.alloc_scratch("cur_level_cond", 1)
-        instrs.append({"alu": [("+", cur_level, const_addrs[0], const_addrs[0])]})
+        instrs.append({"alu": [("+", cur_level, const_addrs[0], const_addrs[0])]}, note="init")
 
         # Cache first 32 tree values (levels 0..4 plus one from level 5)
         tree_cache = self.alloc_scratch("tree_cache", 32)
         tree_cache_addrs = [self.alloc_scratch(f"tree_cache_addr_{i}", 1) for i in range(4)]
         for i in range(4):
             offset = i * VLEN
-            instrs.append({"flow": [("add_imm", tree_cache_addrs[i], self.scratch["forest_values_p"], offset)]})
-            instrs.append({"load": [("vload", tree_cache + offset, tree_cache_addrs[i])]})
+            instrs.append(
+                {"flow": [("add_imm", tree_cache_addrs[i], self.scratch["forest_values_p"], offset)]},
+                note="init",
+            )
+            instrs.append({"load": [("vload", tree_cache + offset, tree_cache_addrs[i])]}, note="init")
         # Temporary vectors for on-the-fly broadcast of indices and cached values
         tmp_vec_idx = self.alloc_scratch("tmp_vec_idx", VLEN)
         tmp_vec_val = self.alloc_scratch("tmp_vec_val", VLEN)
@@ -285,8 +294,14 @@ class KernelBuilder:
         # Compute chunk addresses using add_imm (only once at init, not per round!)
         for c in range(n_chunks):
             offset = c * VLEN
-            instrs.append({"flow": [("add_imm", chunk_addr_idx[c], self.scratch["inp_indices_p"], offset)]})
-            instrs.append({"flow": [("add_imm", chunk_addr_val[c], self.scratch["inp_values_p"], offset)]})
+            instrs.append(
+                {"flow": [("add_imm", chunk_addr_idx[c], self.scratch["inp_indices_p"], offset)]},
+                note="init",
+            )
+            instrs.append(
+                {"flow": [("add_imm", chunk_addr_val[c], self.scratch["inp_values_p"], offset)]},
+                note="init",
+            )
 
         # Double buffering: allow overlap of hash and next-group loads
         # Set A processes while set B loads (and vice versa)
@@ -313,18 +328,18 @@ class KernelBuilder:
             ops = [("vload", idx_addrs[c], chunk_addr_idx[c])]
             if c + 1 < n_chunks:
                 ops.append(("vload", idx_addrs[c + 1], chunk_addr_idx[c + 1]))
-            instrs.append({"load": ops})
+            instrs.append({"load": ops}, note="init")
         for c in range(0, n_chunks, 2):
             ops = [("vload", val_addrs[c], chunk_addr_val[c])]
             if c + 1 < n_chunks:
                 ops.append(("vload", val_addrs[c + 1], chunk_addr_val[c + 1]))
-            instrs.append({"load": ops})
+            instrs.append({"load": ops}, note="init")
 
-        instrs.append({"flow": [("pause",)]})
+        instrs.append({"flow": [("pause",)]}, note="init")
 
-        def append_ops(out, engine, ops):
+        def append_ops(out, engine, ops, note=""):
             for op in ops:
-                out.append((engine, op))
+                out.append((engine, op, note))
 
         # Helper to compute hash and index update for a set
         def build_hash_and_index_slots(data, count):
@@ -334,6 +349,7 @@ class KernelBuilder:
                 slots_out,
                 "valu",
                 [("^", data[c]["vec_val"], data[c]["vec_val"], data[c]["vec_node"]) for c in range(count)],
+                "hash",
             )
             # Hash
             for info in hash_stage_info:
@@ -343,6 +359,7 @@ class KernelBuilder:
                         slots_out,
                         "valu",
                         [("multiply_add", data[c]["vec_val"], data[c]["vec_val"], vmul, vadd) for c in range(count)],
+                        "hash",
                     )
                 else:
                     op1, vc1, op2, op3, vc2 = info
@@ -350,37 +367,43 @@ class KernelBuilder:
                     for c in range(count):
                         ops.append((op1, data[c]["vec_t1"], data[c]["vec_val"], vc1))
                         ops.append((op3, data[c]["vec_t2"], data[c]["vec_val"], vc2))
-                    append_ops(slots_out, "valu", ops)
+                    append_ops(slots_out, "valu", ops, "hash")
                     append_ops(
                         slots_out,
                         "valu",
                         [(op2, data[c]["vec_val"], data[c]["vec_t1"], data[c]["vec_t2"]) for c in range(count)],
+                        "hash",
                     )
             # Index update
             append_ops(
                 slots_out,
                 "valu",
                 [("&", data[c]["vec_t1"], data[c]["vec_val"], vec_one) for c in range(count)],
+                "index",
             )
             append_ops(
                 slots_out,
                 "valu",
                 [("+", data[c]["vec_t1"], data[c]["vec_t1"], vec_one) for c in range(count)],
+                "index",
             )
             append_ops(
                 slots_out,
                 "valu",
                 [("multiply_add", data[c]["vec_idx"], data[c]["vec_idx"], vec_two, data[c]["vec_t1"]) for c in range(count)],
+                "index",
             )
             append_ops(
                 slots_out,
                 "valu",
                 [("<", data[c]["vec_t1"], data[c]["vec_idx"], vec_n_nodes) for c in range(count)],
+                "index",
             )
             append_ops(
                 slots_out,
                 "valu",
                 [("*", data[c]["vec_idx"], data[c]["vec_idx"], data[c]["vec_t1"]) for c in range(count)],
+                "index",
             )
             return slots_out
 
@@ -392,29 +415,33 @@ class KernelBuilder:
                 slots_out,
                 "valu",
                 [("^", data[c]["vec_acc"], vec_zero, vec_zero) for c in range(count)],
+                "cached",
             )
             for idx in range(start, start + count_nodes):
                 idx_const = const_addrs[idx]
-                tree_val = tree_cache + idx
                 append_ops(
                     slots_out,
                     "valu",
-                    [("vbroadcast", tmp_vec_idx, idx_const), ("vbroadcast", tmp_vec_val, tree_val)],
+                    [("vbroadcast", tmp_vec_idx, idx_const), ("vbroadcast", tmp_vec_val, tree_cache + idx)],
+                    "cached",
                 )
                 append_ops(
                     slots_out,
                     "valu",
                     [("==", data[c]["vec_t1"], data[c]["vec_idx"], tmp_vec_idx) for c in range(count)],
+                    "cached",
                 )
                 append_ops(
                     slots_out,
                     "valu",
                     [("multiply_add", data[c]["vec_acc"], data[c]["vec_t1"], tmp_vec_val, data[c]["vec_acc"]) for c in range(count)],
+                    "cached",
                 )
             append_ops(
                 slots_out,
                 "valu",
                 [("^", data[c]["vec_node"], data[c]["vec_acc"], vec_zero) for c in range(count)],
+                "cached",
             )
             return slots_out
 
@@ -441,8 +468,8 @@ class KernelBuilder:
         round0_level = 0 % (forest_height + 1)
         if round0_level <= 3:
             cached_slots = build_cached_tree_slots(cur_data, g_count, round0_level)
-            for engine, op in cached_slots:
-                instrs.append({engine: [op]})
+            for engine, op, note in cached_slots:
+                instrs.append({engine: [op]}, note=note)
         else:
             # Compute tree addresses (ALU per-lane to free VALU for hash)
             alu_ops = []
@@ -452,7 +479,7 @@ class KernelBuilder:
                         ("+", cur_data[c]["tree_addrs"] + i, self.scratch["forest_values_p"], cur_data[c]["vec_idx"] + i)
                     )
             for op in alu_ops:
-                instrs.append({"alu": [op]})
+                instrs.append({"alu": [op]}, note="tree_addr")
 
             # Load tree values for group 0
             load_ops = []
@@ -460,7 +487,7 @@ class KernelBuilder:
                 for i in range(VLEN):
                     load_ops.append(("load", cur_data[c]["vec_node"] + i, cur_data[c]["tree_addrs"] + i))
             for op in load_ops:
-                instrs.append({"load": [op]})
+                instrs.append({"load": [op]}, note="tree_load")
 
         for round_idx in range(rounds):
             round_level = round_idx % (forest_height + 1)
@@ -491,13 +518,13 @@ class KernelBuilder:
                         if c + 1 < g_count:
                             ops.append(("vstore", chunk_addr_idx[g_start + c + 1], cur_data[c + 1]["vec_idx"]))
                         for op in ops:
-                            hash_slots.append(("store", op))
+                            hash_slots.append(("store", op, "store"))
                     for c in range(0, g_count, 2):
                         ops = [("vstore", chunk_addr_val[g_start + c], cur_data[c]["vec_val"])]
                         if c + 1 < g_count:
                             ops.append(("vstore", chunk_addr_val[g_start + c + 1], cur_data[c + 1]["vec_val"]))
                         for op in ops:
-                            hash_slots.append(("store", op))
+                            hash_slots.append(("store", op, "store"))
 
                 # Build next-group prep (loads + address calc + tree loads)
                 next_prep_slots = []
@@ -529,8 +556,8 @@ class KernelBuilder:
                         next_level = (round_idx + 1) % (forest_height + 1)
                     if next_level <= 3:
                         cached_slots = build_cached_tree_slots(next_data, next_count, next_level)
-                        for engine, op in cached_slots:
-                            append_ops(next_prep_slots, engine, [op])
+                        for engine, op, note in cached_slots:
+                            append_ops(next_prep_slots, engine, [op], note)
                     else:
                         alu_ops = []
                         for c in range(next_count):
@@ -538,27 +565,27 @@ class KernelBuilder:
                                 alu_ops.append(
                                     ("+", next_data[c]["tree_addrs"] + i, self.scratch["forest_values_p"], next_data[c]["vec_idx"] + i)
                                 )
-                        append_ops(next_prep_slots, "alu", alu_ops)
+                        append_ops(next_prep_slots, "alu", alu_ops, "tree_addr")
 
                         load_ops = []
                         for c in range(next_count):
                             for i in range(VLEN):
                                 load_ops.append(("load", next_data[c]["vec_node"] + i, next_data[c]["tree_addrs"] + i))
-                        append_ops(next_prep_slots, "load", load_ops)
+                        append_ops(next_prep_slots, "load", load_ops, "tree_load")
 
                 # Emit current group work then next-group prep; list scheduler handles overlap.
-                for engine, op in hash_slots:
-                    instrs.append({engine: [op]})
-                for engine, op in next_prep_slots:
-                    instrs.append({engine: [op]})
+                for engine, op, note in hash_slots:
+                    instrs.append({engine: [op]}, note=note)
+                for engine, op, note in next_prep_slots:
+                    instrs.append({engine: [op]}, note=note)
             # Align next round's start_set with the last group's prefetch target
             start_set = (start_set + n_groups) % 2
             # Update current tree level: cur_level = (cur_level < forest_height) ? cur_level + 1 : 0
-            instrs.append({"alu": [("+", cur_level_next, cur_level, const_addrs[1])]})
-            instrs.append({"alu": [("<", cur_level_cond, cur_level, self.scratch["forest_height"])]})
-            instrs.append({"flow": [("select", cur_level, cur_level_cond, cur_level_next, const_addrs[0])]})
+            instrs.append({"alu": [("+", cur_level_next, cur_level, const_addrs[1])]}, note="level")
+            instrs.append({"alu": [("<", cur_level_cond, cur_level, self.scratch["forest_height"])]}, note="level")
+            instrs.append({"flow": [("select", cur_level, cur_level_cond, cur_level_next, const_addrs[0])]}, note="level")
 
-        instrs.append({"flow": [("pause",)]})
+        instrs.append({"flow": [("pause",)]}, note="epilogue")
         self.emit_from_ast()
 
 BASELINE = 147734
