@@ -69,3 +69,11 @@ Instructions are dicts mapping engine types to instruction slot lists:
 ## Performance Baseline
 
 Starting baseline: 147734 cycles. Impressive threshold: <1487 cycles.
+
+## Optimization Strategy
+
+When optimizing, check theoretical minimums to guide your approach:
+- **Critical path length**: The longest chain of dependent operations determines the minimum possible cycles
+- **Engine throughput**: Total operations divided by slots per engine (e.g., 100 ALU ops / 12 slots = 9 cycles minimum for ALU)
+
+Sometimes you should **temporarily accept a performance regression** if it improves theoretical minimums. For example, restructuring code to reduce critical path depth may initially increase cycle count due to poor scheduling, but opens the door to better final performance once scheduling catches up. Trust the theoretical analysis over short-term benchmark results.
