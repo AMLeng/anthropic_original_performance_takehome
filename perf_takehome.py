@@ -141,9 +141,8 @@ class KernelBuilder:
     def emit_from_ast(self):
         # Compute distance to sink (longest path to any node with no users)
         dist_to_sink = {n: 0 for n in self.ast_nodes}
-        # Process in reverse topological order
         in_degree = {n: len(n.users) for n in self.ast_nodes}
-        queue = [n for n in self.ast_nodes if in_degree[n] == 0]  # Sinks
+        queue = [n for n in self.ast_nodes if in_degree[n] == 0]
         while queue:
             node = queue.pop(0)
             for dep in node.deps:
@@ -154,9 +153,30 @@ class KernelBuilder:
                 if in_degree[dep] == 0:
                     queue.append(dep)
 
+        # Compute distance to nearest LOAD user (prioritize ops that enable loads)
+        dist_to_load = {n: 1000000 for n in self.ast_nodes}
+        for n in self.ast_nodes:
+            if n.engine.value == "load":
+                dist_to_load[n] = 0
+        # Propagate backwards from loads through users
+        changed = True
+        while changed:
+            changed = False
+            for n in self.ast_nodes:
+                for user in n.users:
+                    new_dist = dist_to_load[user] + 1
+                    if new_dist < dist_to_load[n]:
+                        dist_to_load[n] = new_dist
+                        changed = True
+
         def sort_key(n):
-            # Prioritize nodes with longer path to sink (critical path)
-            return (-dist_to_sink[n], n.order)
+            # Priority order:
+            # 1. LOAD operations (bottleneck engine) - highest priority
+            # 2. Operations close to enabling a LOAD
+            # 3. Critical path (dist_to_sink)
+            # 4. Original order for stability
+            is_load = 0 if n.engine.value == "load" else 1
+            return (is_load, dist_to_load[n], -dist_to_sink[n], n.order)
 
         indegree = {n: len(n.deps) for n in self.ast_nodes}
         ready = [n for n in self.ast_nodes if indegree[n] == 0]
@@ -166,23 +186,42 @@ class KernelBuilder:
             slots_used = defaultdict(int)
             bundle = {}
             scheduled = []
-            i = 0
-            while i < len(ready):
-                node = ready[i]
+            remaining = []
+
+            # Two-pass scheduling to maximize LOAD slot utilization
+            # Pass 1: Schedule LOADs and operations that directly enable LOADs
+            for node in ready:
+                eng = node.engine.value
+                limit = SLOT_LIMITS.get(eng, 1)
+                if slots_used[eng] < limit:
+                    # Prioritize LOAD and dist_to_load <= 1
+                    if eng == "load" or dist_to_load[node] <= 1:
+                        slots_used[eng] += 1
+                        bundle.setdefault(eng, []).append(node.operands)
+                        scheduled.append(node)
+                    else:
+                        remaining.append(node)
+                else:
+                    remaining.append(node)
+
+            # Pass 2: Fill remaining slots with other operations
+            for node in remaining:
                 eng = node.engine.value
                 limit = SLOT_LIMITS.get(eng, 1)
                 if slots_used[eng] < limit:
                     slots_used[eng] += 1
                     bundle.setdefault(eng, []).append(node.operands)
                     scheduled.append(node)
-                    ready.pop(i)
-                    continue
-                i += 1
-            # If no node could be scheduled (shouldn't happen), fall back to one node.
+
             if not scheduled:
                 node = ready.pop(0)
                 bundle = {node.engine.value: [node.operands]}
                 scheduled = [node]
+                ready = ready[1:]
+            else:
+                scheduled_set = set(scheduled)
+                ready = [n for n in ready if n not in scheduled_set]
+
             instrs.append(bundle)
             for node in scheduled:
                 for user in list(node.users):
@@ -329,7 +368,6 @@ class KernelBuilder:
 
         # Level 3 cache: disabled for now to maintain correctness
         tree_cache_l3 = None
-        tree_cache_l3_vecs = None
 
         # Precompute ALL chunk addresses at initialization (they never change!)
         # This eliminates add_imm from the hot loop
