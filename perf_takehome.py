@@ -408,8 +408,8 @@ class KernelBuilder:
                 )
                 append_ops(
                     slots_out,
-                    "flow",
-                    [("vselect", data[c]["vec_acc"], data[c]["vec_t1"], tmp_vec_val, data[c]["vec_acc"]) for c in range(count)],
+                    "valu",
+                    [("multiply_add", data[c]["vec_acc"], data[c]["vec_t1"], tmp_vec_val, data[c]["vec_acc"]) for c in range(count)],
                 )
             append_ops(
                 slots_out,
