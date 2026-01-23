@@ -81,7 +81,7 @@ def scratch_reads(engine: EngineKind, op: str, operands: tuple) -> list[int]:
             return [a]
         if op == "vselect":
             _, _, cond, a, b = operands
-            return [cond, a, b]
+            return vec_addrs(cond) + vec_addrs(a) + vec_addrs(b)
         if op in ("cond_jump", "cond_jump_rel"):
             _, cond, _ = operands
             return [cond]
@@ -120,9 +120,12 @@ def scratch_writes(engine: EngineKind, op: str, operands: tuple) -> list[int]:
             return vec_addrs(dest)
         return []
     if engine == EngineKind.FLOW:
-        if op in ("select", "add_imm", "vselect", "coreid"):
+        if op in ("select", "add_imm", "coreid"):
             _, dest, *_ = operands
             return [dest]
+        if op == "vselect":
+            _, dest, *_ = operands
+            return vec_addrs(dest)
         return []
     return []
 
