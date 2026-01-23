@@ -20,6 +20,7 @@ from collections import defaultdict
 import random
 import unittest
 
+from kernel_ast import ASTNode, EngineKind, scratch_reads, scratch_writes
 from problem import (
     Engine,
     DebugInfo,
@@ -37,14 +38,36 @@ from problem import (
 )
 
 
+class _InstrCollector:
+    def __init__(self, owner):
+        self._owner = owner
+
+    def append(self, instr):
+        bundle_id = len(self._owner._bundles)
+        self._owner._bundles.append(instr)
+        for engine, slots in instr.items():
+            for slot in slots:
+                self._owner.add_ast(engine, slot, bundle_id=bundle_id)
+
+    def extend(self, instrs):
+        for instr in instrs:
+            self.append(instr)
+
+
 class KernelBuilder:
     def __init__(self):
-        self.instrs = []
+        self.instrs = _InstrCollector(self)
         self.scratch = {}
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
         self.vec_const_map = {}
+        self.ast_nodes = []
+        self._node_order = 0
+        self._last_write = {}
+        self._last_node = None
+        self._bundles = []
+        self.preserve_bundle_order = False
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -57,11 +80,83 @@ class KernelBuilder:
         return instrs
 
     def add(self, engine, slot):
-        self.instrs.append({engine: [slot]})
+        self.add_ast(engine, slot)
 
     def add_instr(self, instr):
         """Add a pre-built instruction dict directly."""
-        self.instrs.append(instr)
+        for engine, slots in instr.items():
+            for slot in slots:
+                self.add_ast(engine, slot)
+
+    def add_ast(self, engine, slot, note: str = "", bundle_id: int | None = None):
+        engine_kind = EngineKind(engine) if not isinstance(engine, EngineKind) else engine
+        op = slot[0]
+        node = ASTNode(engine=engine_kind, op=op, operands=slot, note=note, order=self._node_order)
+        node.bundle_id = bundle_id
+        self._node_order += 1
+
+        reads = scratch_reads(engine_kind, op, slot)
+        writes = scratch_writes(engine_kind, op, slot)
+
+        for addr in reads:
+            if addr in self._last_write:
+                node.add_dep(self._last_write[addr])
+        for addr in writes:
+            if addr in self._last_write:
+                node.add_dep(self._last_write[addr])
+            self._last_write[addr] = node
+
+        # Preserve original program order until a scheduler is introduced.
+        if self._last_node is not None:
+            node.add_dep(self._last_node)
+        self._last_node = node
+
+        self.ast_nodes.append(node)
+        return node
+
+    def emit_from_ast(self):
+        if self.preserve_bundle_order:
+            # Emit bundles in a dependency-respecting order based on node deps.
+            bundle_deps = {i: set() for i in range(len(self._bundles))}
+            for node in self.ast_nodes:
+                if node.bundle_id is None:
+                    continue
+                for dep in node.deps:
+                    if dep.bundle_id is None:
+                        continue
+                    if dep.bundle_id != node.bundle_id:
+                        bundle_deps[node.bundle_id].add(dep.bundle_id)
+
+            indegree = {i: len(bundle_deps[i]) for i in bundle_deps}
+            ready = [i for i, d in indegree.items() if d == 0]
+            ready.sort()
+            ordered = []
+            while ready:
+                i = ready.pop(0)
+                ordered.append(i)
+                for j in bundle_deps:
+                    if i in bundle_deps[j]:
+                        bundle_deps[j].remove(i)
+                        indegree[j] -= 1
+                        if indegree[j] == 0:
+                            ready.append(j)
+                            ready.sort()
+            self.instrs = [self._bundles[i] for i in ordered]
+            return
+
+        indegree = {n: len(n.deps) for n in self.ast_nodes}
+        ready = [n for n in self.ast_nodes if indegree[n] == 0]
+        ready.sort(key=lambda n: n.order)
+        instrs = []
+        while ready:
+            node = ready.pop(0)
+            instrs.append({node.engine.value: [node.operands]})
+            for user in list(node.users):
+                indegree[user] -= 1
+                if indegree[user] == 0:
+                    ready.append(user)
+                    ready.sort(key=lambda n: n.order)
+        self.instrs = instrs
 
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
@@ -75,7 +170,7 @@ class KernelBuilder:
     def scratch_const(self, val, name=None):
         if val not in self.const_map:
             addr = self.alloc_scratch(name)
-            self.add("load", ("const", addr, val))
+            self.instrs.append({"load": [("const", addr, val)]})
             self.const_map[val] = addr
         return self.const_map[val]
 
@@ -84,7 +179,7 @@ class KernelBuilder:
         if val not in self.vec_const_map:
             scalar_addr = self.scratch_const(val)
             vec_addr = self.alloc_scratch(name, VLEN)
-            self.add("valu", ("vbroadcast", vec_addr, scalar_addr))
+            self.instrs.append({"valu": [("vbroadcast", vec_addr, scalar_addr)]})
             self.vec_const_map[val] = vec_addr
         return self.vec_const_map[val]
 
@@ -396,6 +491,7 @@ class KernelBuilder:
             start_set = (start_set + n_groups) % 2
 
         instrs.append({"flow": [("pause",)]})
+        self.emit_from_ast()
 
 BASELINE = 147734
 
