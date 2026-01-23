@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Iterable
 
+from problem import VLEN
+
 
 class EngineKind(Enum):
     ALU = "alu"
@@ -36,19 +38,22 @@ class ASTNode:
 
 
 def scratch_reads(engine: EngineKind, op: str, operands: tuple) -> list[int]:
+    def vec_addrs(base: int) -> list[int]:
+        return [base + i for i in range(VLEN)]
+
     if engine == EngineKind.ALU:
         _, _, a1, a2 = operands
         return [a1, a2]
     if engine == EngineKind.VALU:
         if op == "multiply_add":
             _, _, a, b, c = operands
-            return [a, b, c]
+            return vec_addrs(a) + vec_addrs(b) + vec_addrs(c)
         if op == "vbroadcast":
             _, _, src = operands
             return [src]
         if len(operands) >= 4:
             _, _, a, b = operands
-            return [a, b]
+            return vec_addrs(a) + vec_addrs(b)
         return []
     if engine == EngineKind.LOAD:
         if op == "load":
@@ -62,6 +67,9 @@ def scratch_reads(engine: EngineKind, op: str, operands: tuple) -> list[int]:
             return [addr]
         return []
     if engine == EngineKind.STORE:
+        if op == "vstore":
+            _, addr, src = operands
+            return [addr] + vec_addrs(src)
         _, addr, src = operands
         return [addr, src]
     if engine == EngineKind.FLOW:
@@ -93,13 +101,23 @@ def scratch_reads(engine: EngineKind, op: str, operands: tuple) -> list[int]:
 
 
 def scratch_writes(engine: EngineKind, op: str, operands: tuple) -> list[int]:
+    def vec_addrs(base: int) -> list[int]:
+        return [base + i for i in range(VLEN)]
+
     if engine in (EngineKind.ALU, EngineKind.VALU):
         _, dest, *_ = operands
+        if engine == EngineKind.VALU and op != "vbroadcast":
+            return vec_addrs(dest)
+        if engine == EngineKind.VALU and op == "vbroadcast":
+            return vec_addrs(dest)
         return [dest]
     if engine == EngineKind.LOAD:
-        if op in ("load", "const", "vload", "load_offset"):
+        if op in ("load", "const", "load_offset"):
             _, dest, *_ = operands
             return [dest]
+        if op == "vload":
+            _, dest, *_ = operands
+            return vec_addrs(dest)
         return []
     if engine == EngineKind.FLOW:
         if op in ("select", "add_imm", "vselect", "coreid"):

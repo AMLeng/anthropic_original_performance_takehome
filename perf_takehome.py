@@ -43,11 +43,9 @@ class _InstrCollector:
         self._owner = owner
 
     def append(self, instr):
-        bundle_id = len(self._owner._bundles)
-        self._owner._bundles.append(instr)
         for engine, slots in instr.items():
             for slot in slots:
-                self._owner.add_ast(engine, slot, bundle_id=bundle_id)
+                self._owner.add_ast(engine, slot)
 
     def extend(self, instrs):
         for instr in instrs:
@@ -65,9 +63,10 @@ class KernelBuilder:
         self.ast_nodes = []
         self._node_order = 0
         self._last_write = {}
-        self._last_node = None
-        self._bundles = []
-        self.preserve_bundle_order = False
+        self._last_read = {}
+        self._last_load = None
+        self._last_store = None
+        self._last_barrier = None
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -88,11 +87,10 @@ class KernelBuilder:
             for slot in slots:
                 self.add_ast(engine, slot)
 
-    def add_ast(self, engine, slot, note: str = "", bundle_id: int | None = None):
+    def add_ast(self, engine, slot, note: str = ""):
         engine_kind = EngineKind(engine) if not isinstance(engine, EngineKind) else engine
         op = slot[0]
         node = ASTNode(engine=engine_kind, op=op, operands=slot, note=note, order=self._node_order)
-        node.bundle_id = bundle_id
         self._node_order += 1
 
         reads = scratch_reads(engine_kind, op, slot)
@@ -101,61 +99,78 @@ class KernelBuilder:
         for addr in reads:
             if addr in self._last_write:
                 node.add_dep(self._last_write[addr])
+            self._last_read[addr] = node
         for addr in writes:
             if addr in self._last_write:
                 node.add_dep(self._last_write[addr])
+            if addr in self._last_read:
+                node.add_dep(self._last_read[addr])
             self._last_write[addr] = node
 
-        # Preserve original program order until a scheduler is introduced.
-        if self._last_node is not None:
-            node.add_dep(self._last_node)
-        self._last_node = node
+        if engine_kind == EngineKind.LOAD:
+            # Prevent load/store reordering, but allow load/load reordering.
+            if self._last_store is not None:
+                node.add_dep(self._last_store)
+            self._last_load = node
+        elif engine_kind == EngineKind.STORE:
+            # Stores should not pass prior loads or stores.
+            if self._last_load is not None:
+                node.add_dep(self._last_load)
+            if self._last_store is not None:
+                node.add_dep(self._last_store)
+            self._last_store = node
+
+        if engine_kind == EngineKind.FLOW and op == "pause":
+            # Pause should occur after all prior scratch writes (barrier).
+            for dep in set(self._last_write.values()):
+                node.add_dep(dep)
+            if self._last_load is not None:
+                node.add_dep(self._last_load)
+            if self._last_store is not None:
+                node.add_dep(self._last_store)
+            if self._last_barrier is not None:
+                node.add_dep(self._last_barrier)
+            self._last_barrier = node
+        elif self._last_barrier is not None:
+            # Everything after a pause must occur after it.
+            node.add_dep(self._last_barrier)
 
         self.ast_nodes.append(node)
         return node
 
     def emit_from_ast(self):
-        if self.preserve_bundle_order:
-            # Emit bundles in a dependency-respecting order based on node deps.
-            bundle_deps = {i: set() for i in range(len(self._bundles))}
-            for node in self.ast_nodes:
-                if node.bundle_id is None:
-                    continue
-                for dep in node.deps:
-                    if dep.bundle_id is None:
-                        continue
-                    if dep.bundle_id != node.bundle_id:
-                        bundle_deps[node.bundle_id].add(dep.bundle_id)
-
-            indegree = {i: len(bundle_deps[i]) for i in bundle_deps}
-            ready = [i for i, d in indegree.items() if d == 0]
-            ready.sort()
-            ordered = []
-            while ready:
-                i = ready.pop(0)
-                ordered.append(i)
-                for j in bundle_deps:
-                    if i in bundle_deps[j]:
-                        bundle_deps[j].remove(i)
-                        indegree[j] -= 1
-                        if indegree[j] == 0:
-                            ready.append(j)
-                            ready.sort()
-            self.instrs = [self._bundles[i] for i in ordered]
-            return
-
         indegree = {n: len(n.deps) for n in self.ast_nodes}
         ready = [n for n in self.ast_nodes if indegree[n] == 0]
         ready.sort(key=lambda n: n.order)
         instrs = []
         while ready:
-            node = ready.pop(0)
-            instrs.append({node.engine.value: [node.operands]})
-            for user in list(node.users):
-                indegree[user] -= 1
-                if indegree[user] == 0:
-                    ready.append(user)
-                    ready.sort(key=lambda n: n.order)
+            slots_used = defaultdict(int)
+            bundle = {}
+            scheduled = []
+            i = 0
+            while i < len(ready):
+                node = ready[i]
+                eng = node.engine.value
+                limit = SLOT_LIMITS.get(eng, 1)
+                if slots_used[eng] < limit:
+                    slots_used[eng] += 1
+                    bundle.setdefault(eng, []).append(node.operands)
+                    scheduled.append(node)
+                    ready.pop(i)
+                    continue
+                i += 1
+            # If no node could be scheduled (shouldn't happen), fall back to one node.
+            if not scheduled:
+                node = ready.pop(0)
+                bundle = {node.engine.value: [node.operands]}
+                scheduled = [node]
+            instrs.append(bundle)
+            for node in scheduled:
+                for user in list(node.users):
+                    indegree[user] -= 1
+                    if indegree[user] == 0:
+                        ready.append(user)
+            ready.sort(key=lambda n: n.order)
         self.instrs = instrs
 
     def alloc_scratch(self, name=None, length=1):
@@ -299,42 +314,16 @@ class KernelBuilder:
 
         instrs.append({"flow": [("pause",)]})
 
-        # Helper to build instruction bundles for a single engine
-        def build_engine_instrs(engine, ops):
-            if not ops:
-                return []
-            limit = SLOT_LIMITS[engine]
-            return [{engine: ops[i:i + limit]} for i in range(0, len(ops), limit)]
-
-        # Helper to merge two streams of single-engine bundles without reordering
-        def merge_streams(primary, secondary):
-            merged = []
-            i = j = 0
-            while i < len(primary) or j < len(secondary):
-                if i >= len(primary):
-                    merged.append(secondary[j])
-                    j += 1
-                    continue
-                if j >= len(secondary):
-                    merged.append(primary[i])
-                    i += 1
-                    continue
-                p = primary[i]
-                s = secondary[j]
-                if set(p.keys()).isdisjoint(s.keys()):
-                    merged.append({**p, **s})
-                    i += 1
-                    j += 1
-                else:
-                    merged.append(p)
-                    i += 1
-            return merged
+        def append_ops(out, engine, ops):
+            for op in ops:
+                out.append((engine, op))
 
         # Helper to compute hash and index update for a set
-        def build_hash_and_index_instrs(data, count):
-            instrs_out = []
+        def build_hash_and_index_slots(data, count):
+            slots_out = []
             # XOR
-            instrs_out += build_engine_instrs(
+            append_ops(
+                slots_out,
                 "valu",
                 [("^", data[c]["vec_val"], data[c]["vec_val"], data[c]["vec_node"]) for c in range(count)],
             )
@@ -342,7 +331,8 @@ class KernelBuilder:
             for info in hash_stage_info:
                 if info[0] == "madd":
                     _, vmul, vadd = info
-                    instrs_out += build_engine_instrs(
+                    append_ops(
+                        slots_out,
                         "valu",
                         [("multiply_add", data[c]["vec_val"], data[c]["vec_val"], vmul, vadd) for c in range(count)],
                     )
@@ -352,33 +342,39 @@ class KernelBuilder:
                     for c in range(count):
                         ops.append((op1, data[c]["vec_t1"], data[c]["vec_val"], vc1))
                         ops.append((op3, data[c]["vec_t2"], data[c]["vec_val"], vc2))
-                    instrs_out += build_engine_instrs("valu", ops)
-                    instrs_out += build_engine_instrs(
+                    append_ops(slots_out, "valu", ops)
+                    append_ops(
+                        slots_out,
                         "valu",
                         [(op2, data[c]["vec_val"], data[c]["vec_t1"], data[c]["vec_t2"]) for c in range(count)],
                     )
             # Index update
-            instrs_out += build_engine_instrs(
+            append_ops(
+                slots_out,
                 "valu",
                 [("&", data[c]["vec_t1"], data[c]["vec_val"], vec_one) for c in range(count)],
             )
-            instrs_out += build_engine_instrs(
+            append_ops(
+                slots_out,
                 "valu",
                 [("+", data[c]["vec_t1"], data[c]["vec_t1"], vec_one) for c in range(count)],
             )
-            instrs_out += build_engine_instrs(
+            append_ops(
+                slots_out,
                 "valu",
                 [("multiply_add", data[c]["vec_idx"], data[c]["vec_idx"], vec_two, data[c]["vec_t1"]) for c in range(count)],
             )
-            instrs_out += build_engine_instrs(
+            append_ops(
+                slots_out,
                 "valu",
                 [("<", data[c]["vec_t1"], data[c]["vec_idx"], vec_n_nodes) for c in range(count)],
             )
-            instrs_out += build_engine_instrs(
+            append_ops(
+                slots_out,
                 "valu",
                 [("*", data[c]["vec_idx"], data[c]["vec_idx"], data[c]["vec_t1"]) for c in range(count)],
             )
-            return instrs_out
+            return slots_out
 
         # Main loop with pipelining
         n_groups = (n_chunks + GROUP_SIZE - 1) // GROUP_SIZE
@@ -404,15 +400,16 @@ class KernelBuilder:
         for c in range(g_count):
             for i in range(VLEN):
                 alu_ops.append(("+", cur_data[c]["tree_addrs"] + i, self.scratch["forest_values_p"], cur_data[c]["vec_idx"] + i))
-        instrs.extend(build_engine_instrs("alu", alu_ops))
+        for op in alu_ops:
+            instrs.append({"alu": [op]})
 
         # Load tree values for group 0
         load_ops = []
         for c in range(g_count):
             for i in range(VLEN):
                 load_ops.append(("load", cur_data[c]["vec_node"] + i, cur_data[c]["tree_addrs"] + i))
-        for i in range(0, len(load_ops), SLOT_LIMITS["load"]):
-            instrs.append({"load": load_ops[i:i + SLOT_LIMITS["load"]]})
+        for op in load_ops:
+            instrs.append({"load": [op]})
 
         for round_idx in range(rounds):
             # Main pipeline loop
@@ -433,24 +430,24 @@ class KernelBuilder:
                     })
 
                 # Build hash and index update for current group
-                hash_instrs = build_hash_and_index_instrs(cur_data, g_count)
+                hash_slots = build_hash_and_index_slots(cur_data, g_count)
                 if round_idx == rounds - 1:
                     # Last round: store results as soon as this group completes
-                    store_instrs = []
                     for c in range(0, g_count, 2):
                         ops = [("vstore", chunk_addr_idx[g_start + c], cur_data[c]["vec_idx"])]
                         if c + 1 < g_count:
                             ops.append(("vstore", chunk_addr_idx[g_start + c + 1], cur_data[c + 1]["vec_idx"]))
-                        store_instrs.append({"store": ops})
+                        for op in ops:
+                            hash_slots.append(("store", op))
                     for c in range(0, g_count, 2):
                         ops = [("vstore", chunk_addr_val[g_start + c], cur_data[c]["vec_val"])]
                         if c + 1 < g_count:
                             ops.append(("vstore", chunk_addr_val[g_start + c + 1], cur_data[c + 1]["vec_val"]))
-                        store_instrs.append({"store": ops})
-                    hash_instrs.extend(store_instrs)
+                        for op in ops:
+                            hash_slots.append(("store", op))
 
                 # Build next-group prep (loads + address calc + tree loads)
-                next_prep_instrs = []
+                next_prep_slots = []
                 next_start = None
                 next_count = 0
                 if g + 1 < n_groups:
@@ -477,16 +474,19 @@ class KernelBuilder:
                     for c in range(next_count):
                         for i in range(VLEN):
                             alu_ops.append(("+", next_data[c]["tree_addrs"] + i, self.scratch["forest_values_p"], next_data[c]["vec_idx"] + i))
-                    next_prep_instrs += build_engine_instrs("alu", alu_ops)
+                    append_ops(next_prep_slots, "alu", alu_ops)
 
                     load_ops = []
                     for c in range(next_count):
                         for i in range(VLEN):
                             load_ops.append(("load", next_data[c]["vec_node"] + i, next_data[c]["tree_addrs"] + i))
-                    next_prep_instrs += build_engine_instrs("load", load_ops)
+                    append_ops(next_prep_slots, "load", load_ops)
 
-                # Overlap hash with next-group prep where safe (different engines)
-                instrs.extend(merge_streams(hash_instrs, next_prep_instrs))
+                # Emit current group work then next-group prep; list scheduler handles overlap.
+                for engine, op in hash_slots:
+                    instrs.append({engine: [op]})
+                for engine, op in next_prep_slots:
+                    instrs.append({engine: [op]})
             # Align next round's start_set with the last group's prefetch target
             start_set = (start_set + n_groups) % 2
 
