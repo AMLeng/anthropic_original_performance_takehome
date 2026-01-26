@@ -77,3 +77,13 @@ When optimizing, check theoretical minimums to guide your approach:
 - **Engine throughput**: Total operations divided by slots per engine (e.g., 100 ALU ops / 12 slots = 9 cycles minimum for ALU)
 
 Sometimes you should **temporarily accept a performance regression** if it improves theoretical minimums. For example, restructuring code to reduce critical path depth may initially increase cycle count due to poor scheduling, but opens the door to better final performance once scheduling catches up. Trust the theoretical analysis over short-term benchmark results.
+
+**Avoid manual instruction batching.** Do not attempt to manually batch multiple operations into single instruction dicts (e.g., putting 6 vbroadcasts in one VALU instruction). The AST-based scheduler in `emit_from_ast()` automatically handles instruction packing and will batch operations optimally based on dependencies and slot limits. Manual batching adds complexity without improving performance.
+
+## Git Workflow
+
+**Always write detailed commit messages.** Each commit should include a comprehensive message describing all work done since the previous commit. Include:
+- Summary of what changed and why
+- Specific optimizations or techniques applied
+- Performance impact (cycle counts, scratch usage) when relevant
+- Any trade-offs or decisions made

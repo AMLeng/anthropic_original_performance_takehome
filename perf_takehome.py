@@ -288,32 +288,36 @@ class KernelBuilder:
                 note="init",
             )
 
-        # Pre-allocate constants
+        # Pre-allocate constants as vectors, with scalar in first element
+        # This saves scratch by reusing the same memory for scalar and vector access
         mul_vals = []
         for op1, val1, op2, op3, val3 in HASH_STAGES:
             if op1 == "+" and op2 == "+" and op3 == "<<":
                 mul_vals.append((1 + (1 << val3)) % (2**32))
-        # Add constant 5 for level-2 bit extraction
-        base_consts = [0, 1, 2, 5]
+        base_consts = [1, 2, 5]
         const_vals = list(set(base_consts + mul_vals + [s[1] for s in HASH_STAGES] + [s[4] for s in HASH_STAGES]))
-        const_addrs = {}
+        const_vals = [v for v in const_vals if v != 0]  # Remove 0 if present
+
+        # vec_zero is free (scratch is zero-initialized)
+        vec_const_addrs = {0: self.alloc_scratch("vc_0", VLEN)}
+
+        # Allocate VLEN words per constant, load scalar into first word, then broadcast
+        for val in const_vals:
+            vec_addr = self.alloc_scratch(f"vc_{val}", VLEN)
+            vec_const_addrs[val] = vec_addr
+        # Load scalars into first element of each vector (2 loads per cycle)
         for i in range(0, len(const_vals), 2):
             ops = []
             for j in range(min(2, len(const_vals) - i)):
-                addr = self.alloc_scratch(f"c_{const_vals[i+j]}")
-                const_addrs[const_vals[i + j]] = addr
-                ops.append(("const", addr, const_vals[i + j]))
+                val = const_vals[i + j]
+                ops.append(("const", vec_const_addrs[val], val))  # Load into first element
             instrs.append({"load": ops}, note="init")
-        self.const_map = const_addrs
+        # Broadcast from first element to fill the vector
+        for val in const_vals:
+            vec_addr = vec_const_addrs[val]
+            instrs.append({"valu": [("vbroadcast", vec_addr, vec_addr)]}, note="init")
 
-        # Broadcast constants to vectors (only those needed for vector ops)
-        vec_base_consts = [0, 1, 2, 5]
-        vec_const_vals = set(vec_base_consts + mul_vals + [s[1] for s in HASH_STAGES] + [s[4] for s in HASH_STAGES])
-        vec_const_addrs = {}
-        for val in vec_const_vals:
-            vec_addr = self.alloc_scratch(f"vc_{val}", VLEN)
-            vec_const_addrs[val] = vec_addr
-            instrs.append({"valu": [("vbroadcast", vec_addr, const_addrs[val])]}, note="init")
+        self.const_map = {v: vec_const_addrs[v] for v in const_vals}  # Scalar = first element of vector
 
         vec_n_nodes = self.alloc_scratch("vec_n_nodes", VLEN)
         instrs.append({"valu": [("vbroadcast", vec_n_nodes, self.scratch["n_nodes"])]}, note="init")
@@ -327,47 +331,16 @@ class KernelBuilder:
             else:
                 hash_stage_info.append((op1, vec_const_addrs[val1], op2, op3, vec_const_addrs[val3]))
 
-        # Cache tree values for levels 0, 1, 2 to avoid scatter loads
-        # Level 0: 1 value (index 0)
-        # Level 1: 2 values (indices 1, 2)
-        # Level 2: 4 values (indices 3, 4, 5, 6)
-        tree_cache_l0 = self.alloc_scratch("tree_cache_l0", 1)
-        tree_cache_l1 = self.alloc_scratch("tree_cache_l1", 2)
-        tree_cache_l2 = self.alloc_scratch("tree_cache_l2", 4)
+        # Cache tree values for levels 0, 1, 2 in a single contiguous block
+        # Layout: [level0] [level1 x2] [level2 x4] [unused] = 8 words for vload
+        # Tree indices: 0, 1, 2, 3, 4, 5, 6, (7 unused but loaded for alignment)
+        tree_cache = self.alloc_scratch("tree_cache", VLEN)
+        tree_cache_l0 = tree_cache + 0  # index 0
+        tree_cache_l1 = tree_cache + 1  # indices 1, 2
+        tree_cache_l2 = tree_cache + 3  # indices 3, 4, 5, 6
 
-        # Load level 0 cache (single value)
-        tree_cache_addr = self.alloc_scratch("tree_cache_addr", 1)
-        instrs.append(
-            {"flow": [("add_imm", tree_cache_addr, self.scratch["forest_values_p"], 0)]},
-            note="init",
-        )
-        instrs.append({"load": [("load", tree_cache_l0, tree_cache_addr)]}, note="init")
-
-        # Load level 1 cache (2 values at indices 1, 2)
-        l1_addr0 = self.alloc_scratch("l1_addr0", 1)
-        l1_addr1 = self.alloc_scratch("l1_addr1", 1)
-        instrs.append(
-            {"flow": [("add_imm", l1_addr0, self.scratch["forest_values_p"], 1)]},
-            note="init",
-        )
-        instrs.append(
-            {"flow": [("add_imm", l1_addr1, self.scratch["forest_values_p"], 2)]},
-            note="init",
-        )
-        instrs.append({"load": [("load", tree_cache_l1, l1_addr0), ("load", tree_cache_l1 + 1, l1_addr1)]}, note="init")
-
-        # Load level 2 cache (4 values at indices 3, 4, 5, 6)
-        l2_addrs = [self.alloc_scratch(f"l2_addr{i}", 1) for i in range(4)]
-        for i in range(4):
-            instrs.append(
-                {"flow": [("add_imm", l2_addrs[i], self.scratch["forest_values_p"], 3 + i)]},
-                note="init",
-            )
-        instrs.append({"load": [("load", tree_cache_l2 + i, l2_addrs[i]) for i in range(2)]}, note="init")
-        instrs.append({"load": [("load", tree_cache_l2 + 2 + i, l2_addrs[2 + i]) for i in range(2)]}, note="init")
-
-        # Level 3 cache: disabled for now to maintain correctness
-        tree_cache_l3 = None
+        # Load all 8 values with a single vload (forest_values_p points to tree[0])
+        instrs.append({"load": [("vload", tree_cache, self.scratch["forest_values_p"])]}, note="init")
 
         # Precompute ALL chunk addresses at initialization (they never change!)
         # This eliminates add_imm from the hot loop
@@ -405,12 +378,7 @@ class KernelBuilder:
         idx_addrs = [base_idx + c * VLEN for c in range(n_chunks)]
         val_addrs = [base_val + c * VLEN for c in range(n_chunks)]
 
-        # Load all indices and values into scratch once (avoid per-round vload/vstore)
-        for c in range(0, n_chunks, 2):
-            ops = [("vload", idx_addrs[c], chunk_addr_idx[c])]
-            if c + 1 < n_chunks:
-                ops.append(("vload", idx_addrs[c + 1], chunk_addr_idx[c + 1]))
-            instrs.append({"load": ops}, note="init")
+        # Load values into scratch (indices start at 0, scratch is zero-initialized)
         for c in range(0, n_chunks, 2):
             ops = [("vload", val_addrs[c], chunk_addr_val[c])]
             if c + 1 < n_chunks:
