@@ -80,6 +80,8 @@ Sometimes you should **temporarily accept a performance regression** if it impro
 
 **Avoid manual instruction batching.** Do not attempt to manually batch multiple operations into single instruction dicts (e.g., putting 6 vbroadcasts in one VALU instruction). The AST-based scheduler in `emit_from_ast()` automatically handles instruction packing and will batch operations optimally based on dependencies and slot limits. Manual batching adds complexity without improving performance.
 
+**Engines are independent with single-cycle latency.** Each engine (ALU, VALU, LOAD, STORE, FLOW) operates in parallel with its own slot limits. All operations, including loads and stores, complete in a single cycle - there is no multi-cycle memory latency. Delaying operations on one engine (e.g., pushing stores later) does NOT free up cycles for other engines. A cycle with only STORE operations still "costs" one cycle even if ALU/VALU/LOAD are idle. When analyzing optimizations, focus on the actual bottleneck engine - moving work between engines only helps if it reduces contention on the bottleneck.
+
 ## Git Workflow
 
 **Always write detailed commit messages.** Each commit should include a comprehensive message describing all work done since the previous commit. Include:

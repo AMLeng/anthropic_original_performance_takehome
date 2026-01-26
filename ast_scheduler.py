@@ -79,8 +79,7 @@ class ASTScheduler:
             # so they don't need store dependencies and stores don't need to wait for them.
             if self._last_store is not None and not readonly:
                 node.add_dep(self._last_store)
-            if not readonly:
-                self._last_load = node
+            self._last_load = node
         elif engine_kind == EngineKind.STORE:
             # Stores should not pass prior loads or stores.
             if self._last_load is not None:

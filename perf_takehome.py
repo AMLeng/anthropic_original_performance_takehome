@@ -181,17 +181,28 @@ class KernelBuilder(ASTScheduler):
         chunk_addr_idx = [self.alloc_scratch(f"cai_{c}") for c in range(n_chunks)]
         chunk_addr_val = [self.alloc_scratch(f"cav_{c}") for c in range(n_chunks)]
 
-        # Compute chunk addresses using add_imm (only once at init, not per round!)
-        for c in range(n_chunks):
-            offset = c * VLEN
-            instrs.append(
-                {"flow": [("add_imm", chunk_addr_idx[c], self.scratch["inp_indices_p"], offset)]},
-                note="init",
-            )
-            instrs.append(
-                {"flow": [("add_imm", chunk_addr_val[c], self.scratch["inp_values_p"], offset)]},
-                note="init",
-            )
+        # Compute chunk addresses using const + ALU instead of add_imm (FLOW has only 1 slot)
+        # Load offset constants (0, 8, 16, ...) - can do 2 per cycle with LOAD
+        offset_temps = [self.alloc_scratch(f"off_{c}") for c in range(n_chunks)]
+        for c in range(0, n_chunks, 2):
+            ops = [("const", offset_temps[c], c * VLEN)]
+            if c + 1 < n_chunks:
+                ops.append(("const", offset_temps[c + 1], (c + 1) * VLEN))
+            instrs.append({"load": ops}, note="init")
+
+        # Use ALU to add offsets to base pointers (12 slots per cycle)
+        # Compute idx addresses
+        for c in range(0, n_chunks, 12):
+            alu_ops = []
+            for i in range(min(12, n_chunks - c)):
+                alu_ops.append(("+", chunk_addr_idx[c + i], self.scratch["inp_indices_p"], offset_temps[c + i]))
+            instrs.append({"alu": alu_ops}, note="init")
+        # Compute val addresses
+        for c in range(0, n_chunks, 12):
+            alu_ops = []
+            for i in range(min(12, n_chunks - c)):
+                alu_ops.append(("+", chunk_addr_val[c + i], self.scratch["inp_values_p"], offset_temps[c + i]))
+            instrs.append({"alu": alu_ops}, note="init")
 
         # Double buffering: allow overlap of hash and next-group loads
         # Set A processes while set B loads (and vice versa)
