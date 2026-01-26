@@ -42,10 +42,10 @@ class _InstrCollector:
     def __init__(self, owner):
         self._owner = owner
 
-    def append(self, instr, note: str = ""):
+    def append(self, instr, note: str = "", readonly: bool = False):
         for engine, slots in instr.items():
             for slot in slots:
-                self._owner.add_ast(engine, slot, note=note)
+                self._owner.add_ast(engine, slot, note=note, readonly=readonly)
 
     def extend(self, instrs, note: str = ""):
         for instr in instrs:
@@ -87,7 +87,7 @@ class KernelBuilder:
             for slot in slots:
                 self.add_ast(engine, slot, note=note)
 
-    def add_ast(self, engine, slot, note: str = ""):
+    def add_ast(self, engine, slot, note: str = "", readonly: bool = False):
         engine_kind = EngineKind(engine) if not isinstance(engine, EngineKind) else engine
         op = slot[0]
         node = ASTNode(engine=engine_kind, op=op, operands=slot, note=note, order=self._node_order)
@@ -109,9 +109,12 @@ class KernelBuilder:
 
         if engine_kind == EngineKind.LOAD:
             # Prevent load/store reordering, but allow load/load reordering.
-            if self._last_store is not None:
+            # Readonly loads (e.g., tree loads) access memory that stores never touch,
+            # so they don't need store dependencies and stores don't need to wait for them.
+            if self._last_store is not None and not readonly:
                 node.add_dep(self._last_store)
-            self._last_load = node
+            if not readonly:
+                self._last_load = node
         elif engine_kind == EngineKind.STORE:
             # Stores should not pass prior loads or stores.
             if self._last_load is not None:
@@ -139,16 +142,21 @@ class KernelBuilder:
         return node
 
     def emit_from_ast(self):
-        # Compute distance to sink (longest path to any node with no users)
-        dist_to_sink = {n: 0 for n in self.ast_nodes}
+        # Compute dist_to_pause: longest path from each node to pause nodes
+        # This replaces dist_to_sink to avoid distortion from store dependencies
+        pause_nodes = [n for n in self.ast_nodes if n.op == "pause"]
+        dist_to_pause = {n: 0 for n in self.ast_nodes}
+        for pause in pause_nodes:
+            dist_to_pause[pause] = 0
+        # Propagate backwards using longest path (like dist_to_sink but only to pause)
         in_degree = {n: len(n.users) for n in self.ast_nodes}
         queue = [n for n in self.ast_nodes if in_degree[n] == 0]
         while queue:
             node = queue.pop(0)
             for dep in node.deps:
-                new_dist = dist_to_sink[node] + 1
-                if new_dist > dist_to_sink[dep]:
-                    dist_to_sink[dep] = new_dist
+                new_dist = dist_to_pause[node] + 1
+                if new_dist > dist_to_pause[dep]:
+                    dist_to_pause[dep] = new_dist
                 in_degree[dep] -= 1
                 if in_degree[dep] == 0:
                     queue.append(dep)
@@ -171,12 +179,17 @@ class KernelBuilder:
 
         def sort_key(n):
             # Priority order:
-            # 1. LOAD operations (bottleneck engine) - highest priority
-            # 2. Operations close to enabling a LOAD
-            # 3. Critical path (dist_to_sink)
+            # 1. Memory ops first (limited slots - LOAD=0, STORE=1, other=2)
+            # 2. dist_to_load (lower = closer to enabling a LOAD)
+            # 3. dist_to_pause (higher = earlier in DAG = unblocks more work)
             # 4. Original order for stability
-            is_load = 0 if n.engine.value == "load" else 1
-            return (is_load, dist_to_load[n], -dist_to_sink[n], n.order)
+            if n.engine.value == "load":
+                mem_priority = 0
+            elif n.engine.value == "store":
+                mem_priority = 1
+            else:
+                mem_priority = 2
+            return (mem_priority, dist_to_load[n], -dist_to_pause[n], n.order)
 
         indegree = {n: len(n.deps) for n in self.ast_nodes}
         ready = [n for n in self.ast_nodes if indegree[n] == 0]
@@ -188,14 +201,14 @@ class KernelBuilder:
             scheduled = []
             remaining = []
 
-            # Two-pass scheduling to maximize LOAD slot utilization
-            # Pass 1: Schedule LOADs and operations that directly enable LOADs
+            # Two-pass scheduling to maximize LOAD/STORE slot utilization
+            # Pass 1: Schedule LOADs, STOREs, and ops close to enabling LOADs
             for node in ready:
                 eng = node.engine.value
                 limit = SLOT_LIMITS.get(eng, 1)
                 if slots_used[eng] < limit:
-                    # Prioritize LOAD and dist_to_load <= 1
-                    if eng == "load" or dist_to_load[node] <= 1:
+                    # Prioritize: memory ops, LOAD-enabling ops
+                    if eng in ("load", "store") or dist_to_load[node] <= 1:
                         slots_used[eng] += 1
                         bundle.setdefault(eng, []).append(node.operands)
                         scheduled.append(node)
@@ -340,7 +353,8 @@ class KernelBuilder:
         tree_cache_l2 = tree_cache + 3  # indices 3, 4, 5, 6
 
         # Load all 8 values with a single vload (forest_values_p points to tree[0])
-        instrs.append({"load": [("vload", tree_cache, self.scratch["forest_values_p"])]}, note="init")
+        # Tree cache is from read-only memory
+        instrs.append({"load": [("vload", tree_cache, self.scratch["forest_values_p"])]}, note="init", readonly=True)
 
         # Precompute ALL chunk addresses at initialization (they never change!)
         # This eliminates add_imm from the hot loop
@@ -387,9 +401,9 @@ class KernelBuilder:
 
         instrs.append({"flow": [("pause",)]}, note="init")
 
-        def append_ops(out, engine, ops, note=""):
+        def append_ops(out, engine, ops, note="", readonly=False):
             for op in ops:
-                out.append((engine, op, note))
+                out.append((engine, op, note, readonly))
 
         # Helper to compute hash and index update for a set
         def build_hash_and_index_slots(data, count, needs_clamp=True):
@@ -526,7 +540,8 @@ class KernelBuilder:
                 for c in range(count):
                     for i in range(VLEN):
                         load_ops.append(("load", data[c]["vec_node"] + i, data[c]["tree_addrs"] + i))
-                append_ops(slots_out, "load", load_ops, "tree_load")
+                # Tree loads are from read-only memory, can be reordered with stores
+                append_ops(slots_out, "load", load_ops, "tree_load", readonly=True)
             return slots_out
 
         # Main loop with pipelining
@@ -550,8 +565,8 @@ class KernelBuilder:
 
         # Load tree values for prologue (round 0 = level 0)
         prologue_slots = build_tree_load_slots(cur_data, g_count, level=0)
-        for engine, op, note in prologue_slots:
-            instrs.append({engine: [op]}, note=note)
+        for engine, op, note, readonly in prologue_slots:
+            instrs.append({engine: [op]}, note=note, readonly=readonly)
 
         for round_idx in range(rounds):
             round_level = round_idx % (forest_height + 1)
@@ -583,13 +598,13 @@ class KernelBuilder:
                         if c + 1 < g_count:
                             ops.append(("vstore", chunk_addr_idx[g_start + c + 1], cur_data[c + 1]["vec_idx"]))
                         for op in ops:
-                            hash_slots.append(("store", op, "store"))
+                            hash_slots.append(("store", op, "store", False))
                     for c in range(0, g_count, 2):
                         ops = [("vstore", chunk_addr_val[g_start + c], cur_data[c]["vec_val"])]
                         if c + 1 < g_count:
                             ops.append(("vstore", chunk_addr_val[g_start + c + 1], cur_data[c + 1]["vec_val"]))
                         for op in ops:
-                            hash_slots.append(("store", op, "store"))
+                            hash_slots.append(("store", op, "store", False))
 
                 # Build next-group prep (loads + address calc + tree loads)
                 next_prep_slots = []
@@ -626,10 +641,10 @@ class KernelBuilder:
 
                 # Emit next-group prep FIRST to give it lower order numbers for priority scheduling
                 # Then emit current group work; AST scheduler handles overlap via dependencies
-                for engine, op, note in next_prep_slots:
-                    instrs.append({engine: [op]}, note=note)
-                for engine, op, note in hash_slots:
-                    instrs.append({engine: [op]}, note=note)
+                for engine, op, note, readonly in next_prep_slots:
+                    instrs.append({engine: [op]}, note=note, readonly=readonly)
+                for engine, op, note, readonly in hash_slots:
+                    instrs.append({engine: [op]}, note=note, readonly=readonly)
             # Align next round's start_set with the last group's prefetch target
             start_set = (start_set + n_groups) % 2
 
