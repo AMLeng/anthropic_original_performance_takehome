@@ -79,12 +79,12 @@ class ASTScheduler:
                 node.add_dep(self._last_store)
             self._last_load = node
         elif engine_kind == EngineKind.STORE:
-            # Stores should not pass prior loads or stores.
+            # Stores must wait for prior loads to avoid reading stale data.
+            # But stores to different addresses can run in parallel (no WAW conflicts).
             if self._last_load is not None:
                 node.add_dep(self._last_load)
-            if self._last_store is not None:
-                node.add_dep(self._last_store)
-            self._last_store = node
+            # Note: we don't track _last_store dependencies because all stores
+            # in this kernel write to different memory addresses.
 
         # Note: pause instructions are no-ops at runtime (enable_pause=False in tests)
         # and the data dependencies (scratch reads/writes) are sufficient for correctness.
@@ -98,11 +98,21 @@ class ASTScheduler:
         # Compute dist_to_store: longest path from each node to store nodes
         # Higher values = earlier in DAG = unblocks more work toward output
         store_nodes = [n for n in self.ast_nodes if n.engine.value == "store"]
+
+        # For priority computation, treat stores as if they were chained by order.
+        # This gives a consistent depth metric without adding actual dependencies.
+        store_nodes_sorted = sorted(store_nodes, key=lambda n: n.order)
         dist_to_store = {n: 0 for n in self.ast_nodes}
-        for store in store_nodes:
-            dist_to_store[store] = 0
-        # Propagate backwards from stores
+        # Assign increasing distances to stores based on order (last store = 0)
+        for i, store in enumerate(reversed(store_nodes_sorted)):
+            dist_to_store[store] = i
+
+        # Build virtual user counts: actual users + virtual chain for stores
         in_degree = {n: len(n.users) for n in self.ast_nodes}
+        # Add virtual chain: each store (except last) has one virtual user
+        for i in range(len(store_nodes_sorted) - 1):
+            in_degree[store_nodes_sorted[i]] += 1
+
         queue = [n for n in self.ast_nodes if in_degree[n] == 0]
         while queue:
             node = queue.pop(0)
@@ -113,6 +123,14 @@ class ASTScheduler:
                 in_degree[dep] -= 1
                 if in_degree[dep] == 0:
                     queue.append(dep)
+            # Process virtual chain: when a store is processed, decrement its predecessor
+            if node.engine.value == "store":
+                idx = store_nodes_sorted.index(node)
+                if idx > 0:
+                    prev_store = store_nodes_sorted[idx - 1]
+                    in_degree[prev_store] -= 1
+                    if in_degree[prev_store] == 0:
+                        queue.append(prev_store)
 
         # Compute distance to nearest LOAD user (prioritize ops that enable loads)
         dist_to_load = {n: 1000000 for n in self.ast_nodes}
