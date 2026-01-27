@@ -93,24 +93,18 @@ class ASTScheduler:
         self.ast_nodes.append(node)
         return node
 
-    def emit_from_ast(self):
-        """Schedule AST nodes into VLIW instruction bundles."""
-        # Compute dist_to_store: longest path from each node to store nodes
-        # Higher values = earlier in DAG = unblocks more work toward output
-        store_nodes = [n for n in self.ast_nodes if n.engine.value == "store"]
+    def _schedule_with_chain_increment(self, store_nodes_sorted, chain_increment):
+        """Schedule AST nodes with a given virtual chain increment."""
+        num_stores = len(store_nodes_sorted)
 
-        # For priority computation, treat stores as if they were chained by order.
-        # This gives a consistent depth metric without adding actual dependencies.
-        store_nodes_sorted = sorted(store_nodes, key=lambda n: n.order)
+        # Compute dist_to_store with virtual chain for priority
         dist_to_store = {n: 0 for n in self.ast_nodes}
-        # Assign increasing distances to stores based on order (last store = 0)
         for i, store in enumerate(reversed(store_nodes_sorted)):
-            dist_to_store[store] = i
+            dist_to_store[store] = i * chain_increment
 
         # Build virtual user counts: actual users + virtual chain for stores
         in_degree = {n: len(n.users) for n in self.ast_nodes}
-        # Add virtual chain: each store (except last) has one virtual user
-        for i in range(len(store_nodes_sorted) - 1):
+        for i in range(num_stores - 1):
             in_degree[store_nodes_sorted[i]] += 1
 
         queue = [n for n in self.ast_nodes if in_degree[n] == 0]
@@ -123,7 +117,6 @@ class ASTScheduler:
                 in_degree[dep] -= 1
                 if in_degree[dep] == 0:
                     queue.append(dep)
-            # Process virtual chain: when a store is processed, decrement its predecessor
             if node.engine.value == "store":
                 idx = store_nodes_sorted.index(node)
                 if idx > 0:
@@ -132,12 +125,11 @@ class ASTScheduler:
                     if in_degree[prev_store] == 0:
                         queue.append(prev_store)
 
-        # Compute distance to nearest LOAD user (prioritize ops that enable loads)
+        # Compute distance to nearest LOAD user
         dist_to_load = {n: 1000000 for n in self.ast_nodes}
         for n in self.ast_nodes:
             if n.engine.value == "load":
                 dist_to_load[n] = 0
-        # Propagate backwards from loads through users
         changed = True
         while changed:
             changed = False
@@ -149,12 +141,9 @@ class ASTScheduler:
                         changed = True
 
         def sort_key(n):
-            # Priority order:
-            # 1. dist_to_load (lower = closer to enabling a LOAD)
-            # 2. dist_to_store (higher = earlier in DAG = unblocks more work toward output)
-            # 3. Original order for stability
             return (dist_to_load[n], -dist_to_store[n], n.order)
 
+        # Schedule
         indegree = {n: len(n.deps) for n in self.ast_nodes}
         ready = [n for n in self.ast_nodes if indegree[n] == 0]
         ready.sort(key=sort_key)
@@ -163,8 +152,6 @@ class ASTScheduler:
             slots_used = defaultdict(int)
             bundle = {}
             scheduled = []
-
-            # Single-pass scheduling: fill slots up to limits
             for node in ready:
                 eng = node.engine.value
                 limit = SLOT_LIMITS.get(eng, 1)
@@ -172,7 +159,6 @@ class ASTScheduler:
                     slots_used[eng] += 1
                     bundle.setdefault(eng, []).append(node.operands)
                     scheduled.append(node)
-
             if not scheduled:
                 node = ready.pop(0)
                 bundle = {node.engine.value: [node.operands]}
@@ -181,7 +167,6 @@ class ASTScheduler:
             else:
                 scheduled_set = set(scheduled)
                 ready = [n for n in ready if n not in scheduled_set]
-
             instrs.append(bundle)
             for node in scheduled:
                 for user in list(node.users):
@@ -189,4 +174,20 @@ class ASTScheduler:
                     if indegree[user] == 0:
                         ready.append(user)
             ready.sort(key=sort_key)
-        self.instrs = instrs
+        return instrs
+
+    def emit_from_ast(self):
+        """Schedule AST nodes into VLIW instruction bundles."""
+        store_nodes = [n for n in self.ast_nodes if n.engine.value == "store"]
+        store_nodes_sorted = sorted(store_nodes, key=lambda n: n.order)
+
+        # Try different chain increments and pick the best
+        best_instrs = None
+        best_cycles = float('inf')
+        for chain_increment in [1, 2, 3, 4, 5, 6, 7, 8]:
+            instrs = self._schedule_with_chain_increment(store_nodes_sorted, chain_increment)
+            if len(instrs) < best_cycles:
+                best_cycles = len(instrs)
+                best_instrs = instrs
+
+        self.instrs = best_instrs
