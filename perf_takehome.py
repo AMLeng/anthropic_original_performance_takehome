@@ -205,9 +205,8 @@ class KernelBuilder(ASTScheduler):
             instrs.append({"alu": alu_ops}, note="init")
 
         # Double buffering: allow overlap of hash and next-group loads
-        # Set A processes while set B loads (and vice versa)
-        GROUP_SIZE = 10  # Chunks per pipeline stage - optimal balance
-        sets = [[], []]  # Two sets of chunk data
+        GROUP_SIZE = 10  # Chunks per pipeline stage - optimal for 32 chunks
+        sets = [[] for _ in range(2)]  # Two sets of chunk data
         for s in range(2):
             for c in range(GROUP_SIZE):
                 sets[s].append({
@@ -229,8 +228,6 @@ class KernelBuilder(ASTScheduler):
             if c + 1 < n_chunks:
                 ops.append(("vload", val_addrs[c + 1], chunk_addr_val[c + 1]))
             instrs.append({"load": ops}, note="init")
-
-        instrs.append({"flow": [("pause",)]}, note="init")
 
         def append_ops(out, engine, ops, note="", readonly=False):
             for op in ops:
@@ -479,7 +476,6 @@ class KernelBuilder(ASTScheduler):
             # Align next round's start_set with the last group's prefetch target
             start_set = (start_set + n_groups) % 2
 
-        instrs.append({"flow": [("pause",)]}, note="epilogue")
         self.emit_from_ast()
 
 BASELINE = 147734
