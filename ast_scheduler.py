@@ -146,17 +146,10 @@ class ASTScheduler:
 
         def sort_key(n):
             # Priority order:
-            # 1. Memory ops first (limited slots - LOAD=0, STORE=1, other=2)
-            # 2. dist_to_load (lower = closer to enabling a LOAD)
-            # 3. dist_to_pause (higher = earlier in DAG = unblocks more work)
-            # 4. Original order for stability
-            if n.engine.value == "load":
-                mem_priority = 0
-            elif n.engine.value == "store":
-                mem_priority = 1
-            else:
-                mem_priority = 2
-            return (mem_priority, dist_to_load[n], -dist_to_pause[n], n.order)
+            # 1. dist_to_load (lower = closer to enabling a LOAD)
+            # 2. dist_to_pause (higher = earlier in DAG = unblocks more work)
+            # 3. Original order for stability
+            return (dist_to_load[n], -dist_to_pause[n], n.order)
 
         indegree = {n: len(n.deps) for n in self.ast_nodes}
         ready = [n for n in self.ast_nodes if indegree[n] == 0]
@@ -166,26 +159,9 @@ class ASTScheduler:
             slots_used = defaultdict(int)
             bundle = {}
             scheduled = []
-            remaining = []
 
-            # Two-pass scheduling to maximize LOAD/STORE slot utilization
-            # Pass 1: Schedule LOADs, STOREs, and ops close to enabling LOADs
+            # Single-pass scheduling: fill slots up to limits
             for node in ready:
-                eng = node.engine.value
-                limit = SLOT_LIMITS.get(eng, 1)
-                if slots_used[eng] < limit:
-                    # Prioritize: memory ops, LOAD-enabling ops
-                    if eng in ("load", "store") or dist_to_load[node] <= 1:
-                        slots_used[eng] += 1
-                        bundle.setdefault(eng, []).append(node.operands)
-                        scheduled.append(node)
-                    else:
-                        remaining.append(node)
-                else:
-                    remaining.append(node)
-
-            # Pass 2: Fill remaining slots with other operations
-            for node in remaining:
                 eng = node.engine.value
                 limit = SLOT_LIMITS.get(eng, 1)
                 if slots_used[eng] < limit:
