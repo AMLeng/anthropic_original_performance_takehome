@@ -142,8 +142,28 @@ class ASTScheduler:
                         dist_to_load[n] = new_dist
                         changed = True
 
+        # Compute critical path length (longest path to any sink) using reverse topological order
+        critical_path = {n: 0 for n in self.ast_nodes}
+        # Process nodes in reverse topological order (sinks first)
+        out_degree = {n: len(n.users) for n in self.ast_nodes}
+        rev_topo = []
+        ready_cp = [n for n in self.ast_nodes if out_degree[n] == 0]
+        while ready_cp:
+            node = ready_cp.pop()
+            rev_topo.append(node)
+            for dep in node.deps:
+                out_degree[dep] -= 1
+                if out_degree[dep] == 0:
+                    ready_cp.append(dep)
+        # Compute critical path in reverse topological order
+        for node in rev_topo:
+            for dep in node.deps:
+                new_cp = critical_path[node] + 1
+                if new_cp > critical_path[dep]:
+                    critical_path[dep] = new_cp
+
         def sort_key(n):
-            return (dist_to_load[n], -dist_to_store[n], n.order)
+            return (dist_to_load[n], -dist_to_store[n], -critical_path[n], n.order)
 
         # Schedule
         indegree = {n: len(n.deps) for n in self.ast_nodes}
@@ -186,7 +206,7 @@ class ASTScheduler:
         # Try different chain increments and pick the best
         best_instrs = None
         best_cycles = float('inf')
-        for chain_increment in range(1,32):
+        for chain_increment in range(10,18,2):
             instrs = self._schedule_with_chain_increment(store_nodes_sorted, chain_increment)
             if len(instrs) < best_cycles:
                 best_cycles = len(instrs)
