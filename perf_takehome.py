@@ -680,7 +680,7 @@ class KernelBuilder(ASTScheduler):
             next_level_g0_tree = []
             if not is_last_level:
                 next_level, _, _, next_round_idx = level_list[level_idx + 1]
-                next_use_l3_cache = (CACHE_LEVELS >= 4 and next_level == 3 and next_round_idx <= forest_height)
+                next_use_l3_cache = (CACHE_LEVELS >= 4 and next_level == 3)
                 data, g_count, g_start = build_data_for_group(0, group_set[0])
                 next_level_g0_tree, _ = build_tree_load_slots(data, g_count, next_level, next_use_l3_cache)
 
