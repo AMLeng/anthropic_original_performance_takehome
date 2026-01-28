@@ -243,6 +243,32 @@ class KernelBuilder(ASTScheduler):
                 alu_ops.append(("+", chunk_addr_val[c + i], self.scratch["inp_values_p"], offset_temps[c + i]))
             instrs.append({"alu": alu_ops}, note="init")
 
+        # === SCRATCH REUSE: offset_temps are no longer needed ===
+        # Reuse offset_temps addresses (32 words) for first 4 level-3 pre-broadcast vectors
+        # Allocate remaining 4 vectors from remaining scratch
+        tree_l3_vec_0 = offset_temps[0]   # Reuse offset_temps[0:7]
+        tree_l3_vec_1 = offset_temps[8]   # Reuse offset_temps[8:15]
+        tree_l3_vec_2 = offset_temps[16]  # Reuse offset_temps[16:23]
+        tree_l3_vec_3 = offset_temps[24]  # Reuse offset_temps[24:31]
+        tree_l3_vec_4 = self.alloc_scratch("tree_l3_vec_4", VLEN)
+        tree_l3_vec_5 = self.alloc_scratch("tree_l3_vec_5", VLEN)
+        tree_l3_vec_6 = self.alloc_scratch("tree_l3_vec_6", VLEN)
+        tree_l3_vec_7 = self.alloc_scratch("tree_l3_vec_7", VLEN)
+
+        # Pre-broadcast level 3 tree cache values (indices 7-14)
+        instrs.append({"valu": [
+            ("vbroadcast", tree_l3_vec_0, tree_cache_l3 + 0),
+            ("vbroadcast", tree_l3_vec_1, tree_cache_l3 + 1),
+            ("vbroadcast", tree_l3_vec_2, tree_cache_l3 + 2),
+            ("vbroadcast", tree_l3_vec_3, tree_cache_l3 + 3),
+            ("vbroadcast", tree_l3_vec_4, tree_cache_l3 + 4),
+            ("vbroadcast", tree_l3_vec_5, tree_cache_l3 + 5),
+        ]}, note="init")
+        instrs.append({"valu": [
+            ("vbroadcast", tree_l3_vec_6, tree_cache_l3 + 6),
+            ("vbroadcast", tree_l3_vec_7, tree_cache_l3 + 7),
+        ]}, note="init")
+
         # Testing different group configurations
         GROUP_SIZE = 4   # Chunks per group
         N_SETS = 4       # Number of working sets
@@ -460,8 +486,9 @@ class KernelBuilder(ASTScheduler):
                 for c in range(count):
                     append_ops(slots_out, "flow", [("vselect", data[c]["vec_node"], data[c]["vec_node"], data[c]["vec_t1"], data[c]["vec_t2"])], "tree_l2_sel3")
             elif use_level3_cache:
-                # Level 3 (first pass only): vec_idx is 7-14, select from 8 cached values
+                # Level 3 (first pass only): vec_idx is 7-14, select from 8 pre-broadcast values
                 # Uses 3-level vselect tree with comparison-based merging
+                # No vbroadcast needed - use pre-broadcast vectors directly!
                 vec_nine = vec_const_addrs[9]
                 vec_eleven = vec_const_addrs[11]
                 vec_thirteen = vec_const_addrs[13]
@@ -471,20 +498,13 @@ class KernelBuilder(ASTScheduler):
                     append_ops(slots_out, "valu", [("&", data[c]["tree_addrs"], data[c]["vec_idx"], vec_one)], "tree_l3_bit0")
 
                 # Pair 0,1 (indices 7,8) -> sel_01 in vec_t1
+                # Use pre-broadcast vectors directly
                 for c in range(count):
-                    append_ops(slots_out, "valu", [("vbroadcast", data[c]["vec_t1"], tree_cache_l3 + 0)], "tree_l3")
-                for c in range(count):
-                    append_ops(slots_out, "valu", [("vbroadcast", data[c]["vec_t2"], tree_cache_l3 + 1)], "tree_l3")
-                for c in range(count):
-                    append_ops(slots_out, "flow", [("vselect", data[c]["vec_t1"], data[c]["tree_addrs"], data[c]["vec_t1"], data[c]["vec_t2"])], "tree_l3_sel01")
+                    append_ops(slots_out, "flow", [("vselect", data[c]["vec_t1"], data[c]["tree_addrs"], tree_l3_vec_0, tree_l3_vec_1)], "tree_l3_sel01")
 
                 # Pair 2,3 (indices 9,10) -> sel_23 in vec_t2
                 for c in range(count):
-                    append_ops(slots_out, "valu", [("vbroadcast", data[c]["vec_t2"], tree_cache_l3 + 2)], "tree_l3")
-                for c in range(count):
-                    append_ops(slots_out, "valu", [("vbroadcast", data[c]["vec_node"], tree_cache_l3 + 3)], "tree_l3")
-                for c in range(count):
-                    append_ops(slots_out, "flow", [("vselect", data[c]["vec_t2"], data[c]["tree_addrs"], data[c]["vec_t2"], data[c]["vec_node"])], "tree_l3_sel23")
+                    append_ops(slots_out, "flow", [("vselect", data[c]["vec_t2"], data[c]["tree_addrs"], tree_l3_vec_2, tree_l3_vec_3)], "tree_l3_sel23")
 
                 # Merge sel_01, sel_23 with vec_idx < 9 -> sel_0123 in vec_t1
                 for c in range(count):
@@ -494,19 +514,11 @@ class KernelBuilder(ASTScheduler):
 
                 # Pair 4,5 (indices 11,12) -> sel_45 in vec_t2
                 for c in range(count):
-                    append_ops(slots_out, "valu", [("vbroadcast", data[c]["vec_t2"], tree_cache_l3 + 4)], "tree_l3")
-                for c in range(count):
-                    append_ops(slots_out, "valu", [("vbroadcast", data[c]["vec_node"], tree_cache_l3 + 5)], "tree_l3")
-                for c in range(count):
-                    append_ops(slots_out, "flow", [("vselect", data[c]["vec_t2"], data[c]["tree_addrs"], data[c]["vec_t2"], data[c]["vec_node"])], "tree_l3_sel45")
+                    append_ops(slots_out, "flow", [("vselect", data[c]["vec_t2"], data[c]["tree_addrs"], tree_l3_vec_4, tree_l3_vec_5)], "tree_l3_sel45")
 
                 # Pair 6,7 (indices 13,14) -> sel_67 in vec_t3
                 for c in range(count):
-                    append_ops(slots_out, "valu", [("vbroadcast", data[c]["vec_node"], tree_cache_l3 + 6)], "tree_l3")
-                for c in range(count):
-                    append_ops(slots_out, "valu", [("vbroadcast", data[c]["vec_t3"], tree_cache_l3 + 7)], "tree_l3")
-                for c in range(count):
-                    append_ops(slots_out, "flow", [("vselect", data[c]["vec_t3"], data[c]["tree_addrs"], data[c]["vec_node"], data[c]["vec_t3"])], "tree_l3_sel67")
+                    append_ops(slots_out, "flow", [("vselect", data[c]["vec_t3"], data[c]["tree_addrs"], tree_l3_vec_6, tree_l3_vec_7)], "tree_l3_sel67")
 
                 # Merge sel_45, sel_67 with vec_idx < 13 -> sel_4567 in vec_t2
                 for c in range(count):
