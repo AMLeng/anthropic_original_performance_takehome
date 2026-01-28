@@ -702,6 +702,7 @@ class KernelBuilder(ASTScheduler):
                 for engine, op, note, readonly in group_hash_slots[g]:
                     instrs.append({engine: [op]}, note=note, readonly=readonly)
 
+            for g in range(n_groups):
                 # Emit current group's stores right after hash (matching round-based order)
                 for engine, op, note, readonly in group_store_slots[g]:
                     instrs.append({engine: [op]}, note=note, readonly=readonly)
