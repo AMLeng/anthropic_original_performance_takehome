@@ -190,6 +190,31 @@ class KernelBuilder(ASTScheduler):
             ("vload", tree_cache_l3, tree_l3_addr),
         ]}, note="init", readonly=True)
 
+        # Pre-broadcast tree cache values to vectors to avoid vbroadcast in hot loop
+        # Level 0: 1 value (root)
+        tree_l0_vec = self.alloc_scratch("tree_l0_vec", VLEN)
+        instrs.append({"valu": [("vbroadcast", tree_l0_vec, tree_cache_l0)]}, note="init")
+
+        # Level 1: 2 values (indices 1, 2)
+        tree_l1_vec_0 = self.alloc_scratch("tree_l1_vec_0", VLEN)
+        tree_l1_vec_1 = self.alloc_scratch("tree_l1_vec_1", VLEN)
+        instrs.append({"valu": [
+            ("vbroadcast", tree_l1_vec_0, tree_cache_l1),
+            ("vbroadcast", tree_l1_vec_1, tree_cache_l1 + 1),
+        ]}, note="init")
+
+        # Level 2: 4 values (indices 3, 4, 5, 6)
+        tree_l2_vec_0 = self.alloc_scratch("tree_l2_vec_0", VLEN)
+        tree_l2_vec_1 = self.alloc_scratch("tree_l2_vec_1", VLEN)
+        tree_l2_vec_2 = self.alloc_scratch("tree_l2_vec_2", VLEN)
+        tree_l2_vec_3 = self.alloc_scratch("tree_l2_vec_3", VLEN)
+        instrs.append({"valu": [
+            ("vbroadcast", tree_l2_vec_0, tree_cache_l2),
+            ("vbroadcast", tree_l2_vec_1, tree_cache_l2 + 1),
+            ("vbroadcast", tree_l2_vec_2, tree_cache_l2 + 2),
+            ("vbroadcast", tree_l2_vec_3, tree_cache_l2 + 3),
+        ]}, note="init")
+
         # Precompute ALL chunk addresses at initialization (they never change!)
         # This eliminates add_imm from the hot loop
         chunk_addr_idx = [self.alloc_scratch(f"cai_{c}") for c in range(n_chunks)]
@@ -219,8 +244,8 @@ class KernelBuilder(ASTScheduler):
             instrs.append({"alu": alu_ops}, note="init")
 
         # Testing different group configurations
-        GROUP_SIZE = 6   # Chunks per group
-        N_SETS = 3       # Number of working sets
+        GROUP_SIZE = 4   # Chunks per group
+        N_SETS = 4       # Number of working sets
         sets = [[] for _ in range(N_SETS)]
         for s in range(N_SETS):
             for c in range(GROUP_SIZE):
@@ -245,7 +270,7 @@ class KernelBuilder(ASTScheduler):
                 ops.append(("vload", val_addrs[c + 1], chunk_addr_val[c + 1]))
             instrs.append({"load": ops}, note="init")
 
-        instrs.append({"flow": [("pause",)]}, note="init")
+        # Note: pause removed - it's a no-op in submission tests and causes scheduling issues
 
         # =====================================================================
         # Compute stage structure based on CACHE_LEVELS
@@ -306,15 +331,24 @@ class KernelBuilder(ASTScheduler):
                 out.append((engine, op, note, readonly))
 
         # Helper to compute hash and index update for a single round
-        def build_hash_and_index_slots(data, count, needs_clamp=True):
+        def build_hash_and_index_slots(data, count, needs_clamp=True, tree_val_addr=None):
             slots_out = []
-            # XOR
-            append_ops(
-                slots_out,
-                "valu",
-                [("^", data[c]["vec_val"], data[c]["vec_val"], data[c]["vec_node"]) for c in range(count)],
-                "hash",
-            )
+            # XOR - use tree_val_addr if provided (for pre-broadcast optimization), else vec_node
+            if tree_val_addr is not None:
+                # tree_val_addr is a pre-broadcast vector, use it directly for all chunks
+                append_ops(
+                    slots_out,
+                    "valu",
+                    [("^", data[c]["vec_val"], data[c]["vec_val"], tree_val_addr) for c in range(count)],
+                    "hash",
+                )
+            else:
+                append_ops(
+                    slots_out,
+                    "valu",
+                    [("^", data[c]["vec_val"], data[c]["vec_val"], data[c]["vec_node"]) for c in range(count)],
+                    "hash",
+                )
             # Hash
             nonmadd_stage_idx = 0  # Track which non-madd stage we're on
             for info in hash_stage_info:
@@ -387,24 +421,27 @@ class KernelBuilder(ASTScheduler):
             return slots_out
 
         def build_tree_load_slots(data, count, level, use_level3_cache=False):
-            """Build tree loading for a single level."""
+            """Build tree loading for a single level.
+
+            Returns (slots_out, tree_val_addr) where tree_val_addr is the address
+            to use for the tree value in XOR. For level 0 this is the pre-broadcast
+            vector; for other levels it's vec_node as before.
+            """
             slots_out = []
+            tree_val_addr = None  # None means use vec_node
             if level == 0:
-                # Level 0: broadcast cached root value to all chunks
-                append_ops(
-                    slots_out,
-                    "valu",
-                    [("vbroadcast", data[c]["vec_node"], tree_cache_l0) for c in range(count)],
-                    "tree_l0",
-                )
+                # Level 0: use pre-broadcast root value directly (no vbroadcast needed!)
+                # Return tree_l0_vec address to use directly in XOR
+                tree_val_addr = tree_l0_vec
+                # No operations needed - just return the address
             elif level == 1:
                 # Level 1: vec_idx is 1 or 2
-                # Use vselect: mask = (vec_idx & 1), then vselect(mask, tree[1], tree[2])
+                # Use vselect with pre-broadcast vectors directly
+                # mask = (vec_idx & 1), then vselect(mask, tree_l1_vec_0, tree_l1_vec_1)
                 for c in range(count):
-                    append_ops(slots_out, "valu", [("vbroadcast", data[c]["vec_t1"], tree_cache_l1)], "tree_l1")
-                    append_ops(slots_out, "valu", [("vbroadcast", data[c]["vec_t2"], tree_cache_l1 + 1)], "tree_l1")
                     append_ops(slots_out, "valu", [("&", data[c]["vec_node"], data[c]["vec_idx"], vec_one)], "tree_l1_mask")
-                    append_ops(slots_out, "flow", [("vselect", data[c]["vec_node"], data[c]["vec_node"], data[c]["vec_t1"], data[c]["vec_t2"])], "tree_l1_sel")
+                for c in range(count):
+                    append_ops(slots_out, "flow", [("vselect", data[c]["vec_node"], data[c]["vec_node"], tree_l1_vec_0, tree_l1_vec_1)], "tree_l1_sel")
             elif level == 2:
                 # Level 2: vec_idx is 3, 4, 5, or 6 - nested vselect
                 vec_five = vec_const_addrs[5]
@@ -502,20 +539,20 @@ class KernelBuilder(ASTScheduler):
                         load_ops.append(("load", data[c]["vec_node"] + i, data[c]["tree_addrs"] + i))
                 # Tree loads are from read-only memory, can be reordered with stores
                 append_ops(slots_out, "load", load_ops, "tree_load", readonly=True)
-            return slots_out
+            return slots_out, tree_val_addr
 
         def build_cache_stage_slots(data, count, levels):
             """Build slots for a cache stage covering multiple levels."""
             all_slots = []
             for i, level in enumerate(levels):
                 # Tree load for this level
-                tree_slots = build_tree_load_slots(data, count, level)
+                tree_slots, tree_val_addr = build_tree_load_slots(data, count, level)
                 all_slots.extend(tree_slots)
 
                 # Hash and index update
                 # Clamp only at forest_height (level 10)
                 needs_clamp = (level == forest_height)
-                hash_slots = build_hash_and_index_slots(data, count, needs_clamp)
+                hash_slots = build_hash_and_index_slots(data, count, needs_clamp, tree_val_addr)
                 all_slots.extend(hash_slots)
             return all_slots
 
@@ -523,12 +560,12 @@ class KernelBuilder(ASTScheduler):
             """Build slots for a scatter stage (single level)."""
             all_slots = []
             # Tree load (scatter)
-            tree_slots = build_tree_load_slots(data, count, level)
+            tree_slots, tree_val_addr = build_tree_load_slots(data, count, level)
             all_slots.extend(tree_slots)
 
             # Hash and index update
             needs_clamp = (level == forest_height)
-            hash_slots = build_hash_and_index_slots(data, count, needs_clamp)
+            hash_slots = build_hash_and_index_slots(data, count, needs_clamp, tree_val_addr)
             all_slots.extend(hash_slots)
             return all_slots
 
@@ -592,7 +629,7 @@ class KernelBuilder(ASTScheduler):
 
         # Prologue: Load tree values for group 0 (level 0) - gives it lowest order numbers
         data_g0, g_count_g0, g_start_g0 = build_data_for_group(0, group_set[0])
-        prologue_slots = build_tree_load_slots(data_g0, g_count_g0, level=0)
+        prologue_slots, _ = build_tree_load_slots(data_g0, g_count_g0, level=0)
         for engine, op, note, readonly in prologue_slots:
             instrs.append({engine: [op]}, note=note, readonly=readonly)
 
@@ -613,11 +650,11 @@ class KernelBuilder(ASTScheduler):
                 data, g_count, g_start = build_data_for_group(g, set_idx)
 
                 # Tree loads for this level
-                tree_slots = build_tree_load_slots(data, g_count, level, use_level3_cache)
+                tree_slots, tree_val_addr = build_tree_load_slots(data, g_count, level, use_level3_cache)
 
                 # Hash and index update
                 needs_clamp = (level == forest_height)
-                hash_slots = build_hash_and_index_slots(data, g_count, needs_clamp)
+                hash_slots = build_hash_and_index_slots(data, g_count, needs_clamp, tree_val_addr)
 
                 # Store slots if this is the last level
                 store_slots = []
@@ -634,7 +671,7 @@ class KernelBuilder(ASTScheduler):
                 next_level, _, _, next_round_idx = level_list[level_idx + 1]
                 next_use_l3_cache = (CACHE_LEVELS >= 4 and next_level == 3 and next_round_idx <= forest_height)
                 data, g_count, g_start = build_data_for_group(0, group_set[0])
-                next_level_g0_tree = build_tree_load_slots(data, g_count, next_level, next_use_l3_cache)
+                next_level_g0_tree, _ = build_tree_load_slots(data, g_count, next_level, next_use_l3_cache)
 
             # Emit with interleaving: next-group's tree loads before current-group's hash
             # Stores are interleaved right after each group's hash (matching round-based order)
