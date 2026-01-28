@@ -649,7 +649,7 @@ class KernelBuilder(ASTScheduler):
             is_last_level = (level_idx == len(level_list) - 1)
             # For "first pass only" level 3 caching: use cache only on first traversal
             # First traversal ends at round forest_height (level=forest_height=10 wraps to root)
-            use_level3_cache = (CACHE_LEVELS >= 4 and level == 3 and round_idx <= forest_height)
+            use_level3_cache = (CACHE_LEVELS >= 4 and level == 3)
 
             # Build tree loads and hash operations for all groups
             group_tree_slots = []

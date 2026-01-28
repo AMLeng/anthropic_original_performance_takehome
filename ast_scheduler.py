@@ -186,7 +186,7 @@ class ASTScheduler:
         # Try different chain increments and pick the best
         best_instrs = None
         best_cycles = float('inf')
-        for chain_increment in [1, 2, 3, 4, 5, 6, 7, 8]:
+        for chain_increment in range(1,32):
             instrs = self._schedule_with_chain_increment(store_nodes_sorted, chain_increment)
             if len(instrs) < best_cycles:
                 best_cycles = len(instrs)
