@@ -443,22 +443,18 @@ class KernelBuilder(ASTScheduler):
                 for c in range(count):
                     append_ops(slots_out, "flow", [("vselect", data[c]["vec_node"], data[c]["vec_node"], tree_l1_vec_0, tree_l1_vec_1)], "tree_l1_sel")
             elif level == 2:
-                # Level 2: vec_idx is 3, 4, 5, or 6 - nested vselect
+                # Level 2: vec_idx is 3, 4, 5, or 6 - nested vselect with pre-broadcast vectors
                 vec_five = vec_const_addrs[5]
-                for c in range(count):
-                    append_ops(slots_out, "valu", [("vbroadcast", data[c]["vec_t1"], tree_cache_l2)], "tree_l2")
-                for c in range(count):
-                    append_ops(slots_out, "valu", [("vbroadcast", data[c]["vec_t2"], tree_cache_l2 + 1)], "tree_l2")
+                # Compute bit0 = vec_idx & 1 for pair selection
                 for c in range(count):
                     append_ops(slots_out, "valu", [("&", data[c]["tree_addrs"], data[c]["vec_idx"], vec_one)], "tree_l2_bit0")
+                # Select between tree[3]/tree[4] using pre-broadcast vectors
                 for c in range(count):
-                    append_ops(slots_out, "flow", [("vselect", data[c]["vec_t1"], data[c]["tree_addrs"], data[c]["vec_t1"], data[c]["vec_t2"])], "tree_l2_sel1")
+                    append_ops(slots_out, "flow", [("vselect", data[c]["vec_t1"], data[c]["tree_addrs"], tree_l2_vec_0, tree_l2_vec_1)], "tree_l2_sel1")
+                # Select between tree[5]/tree[6] using pre-broadcast vectors
                 for c in range(count):
-                    append_ops(slots_out, "valu", [("vbroadcast", data[c]["vec_node"], tree_cache_l2 + 2)], "tree_l2")
-                for c in range(count):
-                    append_ops(slots_out, "valu", [("vbroadcast", data[c]["vec_t2"], tree_cache_l2 + 3)], "tree_l2")
-                for c in range(count):
-                    append_ops(slots_out, "flow", [("vselect", data[c]["vec_t2"], data[c]["tree_addrs"], data[c]["vec_node"], data[c]["vec_t2"])], "tree_l2_sel2")
+                    append_ops(slots_out, "flow", [("vselect", data[c]["vec_t2"], data[c]["tree_addrs"], tree_l2_vec_2, tree_l2_vec_3)], "tree_l2_sel2")
+                # Final selection based on idx < 5
                 for c in range(count):
                     append_ops(slots_out, "valu", [("<", data[c]["vec_node"], data[c]["vec_idx"], vec_five)], "tree_l2_cond")
                 for c in range(count):

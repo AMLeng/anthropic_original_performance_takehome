@@ -44,7 +44,7 @@ class ASTScheduler:
         self.ast_nodes = []
         self._node_order = 0
         self._last_write = {}
-        self._last_read = {}
+        self._readers_since_write = defaultdict(set)  # Track ALL readers since last write
         self._last_load = None
         self._last_store = None
 
@@ -62,12 +62,14 @@ class ASTScheduler:
         for addr in reads:
             if addr in self._last_write:
                 node.add_dep(self._last_write[addr])
-            self._last_read[addr] = node
+            self._readers_since_write[addr].add(node)
         for addr in writes:
             if addr in self._last_write:
                 node.add_dep(self._last_write[addr])
-            if addr in self._last_read:
-                node.add_dep(self._last_read[addr])
+            # WAR: depend on ALL readers since the last write
+            for reader in self._readers_since_write[addr]:
+                node.add_dep(reader)
+            self._readers_since_write[addr].clear()
             self._last_write[addr] = node
 
         # Memory ordering for loads and stores
