@@ -101,6 +101,9 @@ class KernelBuilder(ASTScheduler):
         - 3 sets for better pipeline overlap between cache and scatter phases
         - Resilient stage structure that adapts to CACHE_LEVELS
         """
+        # Pause to match first yield of reference_kernel2 (before processing)
+        self.instrs.append({"flow": [("pause",)]})
+
         instrs = self.instrs
         n_chunks = batch_size // VLEN
 
